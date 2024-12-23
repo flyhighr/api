@@ -129,20 +129,24 @@ class ImageGenerator:
     def __init__(self):
         self.playwright = None
         self.browser = None
+        self._initialized = False
         
     async def initialize(self):
-        if not self.playwright:
+        if not self._initialized:
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.firefox.launch()
+            self._initialized = True
 
     async def cleanup(self):
         if self.browser:
             await self.browser.close()
         if self.playwright:
             await self.playwright.stop()
+        self._initialized = False
 
     async def generate(self, messages: List[Message]) -> bytes:
-        await self.initialize()
+        if not self._initialized:
+            await self.initialize()
         
         message_containers = ""
         for msg in messages:
@@ -172,99 +176,93 @@ class ImageGenerator:
             screenshot = await body.screenshot(type='png')
             return screenshot
 
-# Initialize Flask app
-app = Flask(__name__)
-app.config['ENV'] = Config.ENV
-app.config['SECRET_KEY'] = Config.SECRET_KEY
-CORS(app, origins=Config.ALLOWED_ORIGINS)
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=[Config.RATE_LIMIT],
-    storage_uri="memory://"
-)
-
-# Create a single ImageGenerator instance
-image_generator = ImageGenerator()
-
-@app.errorhandler(Exception)
-def handle_error(error):
-    logger.error(f"Error occurred: {str(error)}", exc_info=True)
-    return jsonify({
-        'error': 'Internal server error',
-        'message': str(error)
-    }), 500
-
-@app.route('/')
-def index():
-    return jsonify({
-        'status': 'ok',
-        'endpoints': {
-            '/': 'API information',
-            '/health': 'Health check endpoint',
-            '/generate': 'Generate Discord-style message images (POST)'
-        }
-    })
-
-@app.route('/health')
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat()
-    }), 200
-
-@app.route('/generate', methods=['POST'])
-@limiter.limit(Config.RATE_LIMIT)
-async def generate_image():
-    try:
-        data = request.get_json()
-        if not data or 'messages' not in data:
-            return jsonify({'error': 'Invalid request data'}), 400
-
-        if len(data['messages']) > Config.MAX_MESSAGES:
-            return jsonify({'error': f'Too many messages. Maximum allowed: {Config.MAX_MESSAGES}'}), 400
-
-        messages = []
-        for msg_data in data['messages']:
-            try:
-                message = Message(
-                    username=msg_data['username'],
-                    message=msg_data['message'],
-                    color=msg_data.get('color', '#ffffff'),
-                    timestamp=msg_data.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M')),
-                    avatar_url=msg_data.get('avatar_url', '')
-                )
-                message.validate()
-                messages.append(message)
-            except (KeyError, ValueError) as e:
-                return jsonify({'error': f'Invalid message data: {str(e)}'}), 400
-
-        screenshot = await image_generator.generate(messages)
-
-        return send_file(
-            BytesIO(screenshot),
-            mimetype='image/png',
-            as_attachment=True,
-            download_name='discord_messages.png'
-        )
-
-    except Exception as e:
-        logger.error(f"Error generating image: {str(e)}", exc_info=True)
-        return jsonify({'error': 'Failed to generate image'}), 500
-
-@app.before_first_request
-async def setup_image_generator():
-    await image_generator.initialize()
-
-@app.teardown_appcontext
-async def cleanup_image_generator(exception):
-    await image_generator.cleanup()
-
 def create_app():
+    app = Flask(__name__)
+    app.config['ENV'] = Config.ENV
+    app.config['SECRET_KEY'] = Config.SECRET_KEY
+    CORS(app, origins=Config.ALLOWED_ORIGINS)
+    
+    limiter = Limiter(
+        app=app,
+        key_func=get_remote_address,
+        default_limits=[Config.RATE_LIMIT],
+        storage_uri="memory://"
+    )
+
+    # Create a single ImageGenerator instance
+    image_generator = ImageGenerator()
+
+    @app.errorhandler(Exception)
+    def handle_error(error):
+        logger.error(f"Error occurred: {str(error)}", exc_info=True)
+        return jsonify({
+            'error': 'Internal server error',
+            'message': str(error)
+        }), 500
+
+    @app.route('/')
+    def index():
+        return jsonify({
+            'status': 'ok',
+            'endpoints': {
+                '/': 'API information',
+                '/health': 'Health check endpoint',
+                '/generate': 'Generate Discord-style message images (POST)'
+            }
+        })
+
+    @app.route('/health')
+    def health_check():
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat()
+        }), 200
+
+    @app.route('/generate', methods=['POST'])
+    @limiter.limit(Config.RATE_LIMIT)
+    async def generate_image():
+        try:
+            data = request.get_json()
+            if not data or 'messages' not in data:
+                return jsonify({'error': 'Invalid request data'}), 400
+
+            if len(data['messages']) > Config.MAX_MESSAGES:
+                return jsonify({'error': f'Too many messages. Maximum allowed: {Config.MAX_MESSAGES}'}), 400
+
+            messages = []
+            for msg_data in data['messages']:
+                try:
+                    message = Message(
+                        username=msg_data['username'],
+                        message=msg_data['message'],
+                        color=msg_data.get('color', '#ffffff'),
+                        timestamp=msg_data.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M')),
+                        avatar_url=msg_data.get('avatar_url', '')
+                    )
+                    message.validate()
+                    messages.append(message)
+                except (KeyError, ValueError) as e:
+                    return jsonify({'error': f'Invalid message data: {str(e)}'}), 400
+
+            screenshot = await image_generator.generate(messages)
+
+            return send_file(
+                BytesIO(screenshot),
+                mimetype='image/png',
+                as_attachment=True,
+                download_name='discord_messages.png'
+            )
+
+        except Exception as e:
+            logger.error(f"Error generating image: {str(e)}", exc_info=True)
+            return jsonify({'error': 'Failed to generate image'}), 500
+
     return app
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
+    app = create_app()
+    
     if Config.ENV == 'production':
         serve(app, host='0.0.0.0', port=port)
     else:
