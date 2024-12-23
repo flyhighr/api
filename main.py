@@ -15,6 +15,10 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from waitress import serve
+# Import required for async support
+from asgiref.wsgi import WsgiToAsgi
+from hypercorn.config import Config as HyperConfig
+from hypercorn.asyncio import serve as hypercorn_serve
 
 # Configuration
 class Config:
@@ -259,11 +263,12 @@ def create_app():
 
     return app
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
+async def run_app():
     app = create_app()
-    
-    if Config.ENV == 'production':
-        serve(app, host='0.0.0.0', port=port)
-    else:
-        app.run(host='0.0.0.0', port=port, debug=True)
+    asgi_app = WsgiToAsgi(app)
+    config = HyperConfig()
+    config.bind = [f"0.0.0.0:{int(os.environ.get('PORT', 8080))}"]
+    await hypercorn_serve(asgi_app, config)
+
+if __name__ == '__main__':
+    asyncio.run(run_app())
