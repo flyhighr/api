@@ -1,8 +1,8 @@
 flask==3.0.0
 flask-cors==4.0.0
 flask-limiter==3.5.0
-playwright==1.40.0
 hypercorn==0.15.0
 asgiref==3.7.2
 python-dotenv==1.0.0
 waitress
+pillow
