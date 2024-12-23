@@ -19,26 +19,23 @@ class Config:
     ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
     
-    # Styling configurations
-    FONT_SIZE = 16
-    USERNAME_FONT_SIZE = 16
-    TIMESTAMP_FONT_SIZE = 12
+    # Updated styling to match Discord exactly
+    FONT_SIZE = 13
+    USERNAME_FONT_SIZE = 14
+    TIMESTAMP_FONT_SIZE = 11
     PADDING = 16
-    MESSAGE_SPACING = 8
+    MESSAGE_SPACING = 0  # Discord messages are compact
     AVATAR_SIZE = 40
     MAX_WIDTH = 800
-    BACKGROUND_COLOR = '#36393f'
-    DEFAULT_TEXT_COLOR = '#dcddde'
-    TIMESTAMP_COLOR = '#a3a6aa'
-    USERNAME_SPACING = 8
-    MESSAGE_TOP_PADDING = 2
-    LINE_SPACING = 4
-
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+    BACKGROUND_COLOR = '#313338'  # Updated Discord dark theme
+    DEFAULT_TEXT_COLOR = '#dbdee1'  # Discord message color
+    TIMESTAMP_COLOR = '#949ba4'  # Discord timestamp color
+    USERNAME_SPACING = 6
+    MESSAGE_TOP_PADDING = 4
+    LINE_SPACING = 2
+    REPLY_INDICATOR_COLOR = '#949ba4'
+    REPLY_LINE_WIDTH = 2
+    MESSAGE_BLOCK_SPACING = 16  # Space between message blocks
 
 @dataclass
 class Message:
@@ -47,6 +44,7 @@ class Message:
     color: str
     timestamp: str
     avatar_url: str = ""
+    reply_to: str = None
 
     def validate(self) -> None:
         if len(self.message) > Config.MAX_MESSAGE_LENGTH:
@@ -57,6 +55,7 @@ class Message:
 class ImageGenerator:
     def __init__(self):
         try:
+            # Try to load system fonts - adjust paths based on your system
             self.font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Config.FONT_SIZE)
             self.username_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", Config.USERNAME_FONT_SIZE)
             self.timestamp_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Config.TIMESTAMP_FONT_SIZE)
@@ -69,9 +68,8 @@ class ImageGenerator:
     def _get_avatar(self, avatar_url: str) -> Image.Image:
         try:
             if not avatar_url:
-                avatar = Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#7289da')
-                draw = ImageDraw.Draw(avatar)
-                draw.ellipse((0, 0, Config.AVATAR_SIZE, Config.AVATAR_SIZE), fill='#7289da')
+                # Create default avatar with Discord style
+                avatar = Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#3ba55c')
                 return avatar
 
             response = requests.get(avatar_url, timeout=5)
@@ -100,7 +98,7 @@ class ImageGenerator:
             return output
         except Exception as e:
             logger.error(f"Error fetching avatar: {str(e)}")
-            return Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#7289da')
+            return Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#3ba55c')
 
     def _wrap_text(self, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
         words = text.split()
@@ -108,15 +106,14 @@ class ImageGenerator:
         current_line = []
         
         for word in words:
-            # Handle newlines in messages
             if '\n' in word:
                 subwords = word.split('\n')
                 for i, subword in enumerate(subwords):
                     if subword:
                         current_line.append(subword)
-                        if i < len(subwords) - 1:
-                            lines.append(' '.join(current_line))
-                            current_line = []
+                    if i < len(subwords) - 1:
+                        lines.append(' '.join(current_line))
+                        current_line = []
                 continue
                 
             current_line.append(word)
@@ -146,45 +143,56 @@ class ImageGenerator:
                 Config.MAX_WIDTH - Config.AVATAR_SIZE - Config.PADDING * 3
             )
             
-            # Calculate message block height
             text_height = len(wrapped_text) * (self.font.size + Config.LINE_SPACING)
             header_height = max(Config.USERNAME_FONT_SIZE, Config.TIMESTAMP_FONT_SIZE)
             height = header_height + Config.MESSAGE_TOP_PADDING + text_height
             
             message_heights.append(height)
-            total_height += height + Config.MESSAGE_SPACING
+            total_height += height + Config.MESSAGE_BLOCK_SPACING
 
-        total_height += Config.PADDING - Config.MESSAGE_SPACING
+        # Add final padding
+        total_height += Config.PADDING - Config.MESSAGE_BLOCK_SPACING
 
-        # Create image
+        # Create image with semi-transparent background
         img = Image.new('RGB', (Config.MAX_WIDTH, total_height), Config.BACKGROUND_COLOR)
         draw = ImageDraw.Draw(img)
         
         current_y = Config.PADDING
+        last_author = None
         
-        for msg, height in zip(messages, message_heights):
-            # Draw avatar
-            avatar = self._get_avatar(msg.avatar_url)
-            img.paste(avatar, (Config.PADDING, current_y), avatar if avatar.mode == 'RGBA' else None)
+        for i, (msg, height) in enumerate(zip(messages, message_heights)):
+            # Check if this message is part of a message group
+            is_group_start = last_author != msg.username
+            if is_group_start:
+                current_y += Config.MESSAGE_SPACING
             
-            # Draw username
+            # Draw avatar only for group start
+            if is_group_start:
+                avatar = self._get_avatar(msg.avatar_url)
+                img.paste(avatar, (Config.PADDING, current_y), avatar if avatar.mode == 'RGBA' else None)
+            
             content_x = Config.PADDING * 2 + Config.AVATAR_SIZE
-            username_width = self.username_font.getlength(msg.username)
-            draw.text(
-                (content_x, current_y),
-                msg.username,
-                font=self.username_font,
-                fill=msg.color
-            )
             
-            # Draw timestamp
-            timestamp_x = content_x + username_width + Config.USERNAME_SPACING
-            draw.text(
-                (timestamp_x, current_y + 2),
-                msg.timestamp,
-                font=self.timestamp_font,
-                fill=Config.TIMESTAMP_COLOR
-            )
+            # Draw username and timestamp for group start
+            if is_group_start:
+                username_width = self.username_font.getlength(msg.username)
+                draw.text(
+                    (content_x, current_y),
+                    msg.username,
+                    font=self.username_font,
+                    fill=msg.color
+                )
+                
+                draw.text(
+                    (content_x + username_width + Config.USERNAME_SPACING, current_y + 1),
+                    msg.timestamp,
+                    font=self.timestamp_font,
+                    fill=Config.TIMESTAMP_COLOR
+                )
+                
+                message_y = current_y + Config.USERNAME_FONT_SIZE + Config.MESSAGE_TOP_PADDING
+            else:
+                message_y = current_y
             
             # Draw message
             wrapped_text = self._wrap_text(
@@ -193,18 +201,17 @@ class ImageGenerator:
                 Config.MAX_WIDTH - content_x - Config.PADDING
             )
             
-            text_y = current_y + Config.USERNAME_FONT_SIZE + Config.MESSAGE_TOP_PADDING
-            
             for line in wrapped_text:
                 draw.text(
-                    (content_x, text_y),
+                    (content_x, message_y),
                     line,
                     font=self.font,
                     fill=Config.DEFAULT_TEXT_COLOR
                 )
-                text_y += self.font.size + Config.LINE_SPACING
+                message_y += self.font.size + Config.LINE_SPACING
             
-            current_y += height + Config.MESSAGE_SPACING
+            current_y += height + (Config.MESSAGE_BLOCK_SPACING if is_group_start else Config.MESSAGE_SPACING)
+            last_author = msg.username
 
         # Convert to PNG with optimization
         output = BytesIO()
@@ -259,8 +266,9 @@ def generate_image():
                     username=msg_data['username'],
                     message=msg_data['message'],
                     color=msg_data.get('color', '#ffffff'),
-                    timestamp=msg_data.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M')),
-                    avatar_url=msg_data.get('avatar_url', '')
+                    timestamp=msg_data.get('timestamp', 'Today at ' + datetime.now().strftime('%H:%M')),
+                    avatar_url=msg_data.get('avatar_url', ''),
+                    reply_to=msg_data.get('reply_to', None)
                 )
                 message.validate()
                 messages.append(message)
