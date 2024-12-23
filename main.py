@@ -1,9 +1,3 @@
-"""
-Discord Message Image Generator
-A production-ready Flask application for generating Discord-style message images.
-Simplified for easy deployment on Render.
-"""
-
 import os
 import json
 import logging
@@ -12,8 +6,9 @@ from datetime import datetime
 from dataclasses import dataclass
 import tempfile
 from pathlib import Path
+import gunicorn
 
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, render_template_string
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -24,6 +19,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException
 from io import BytesIO
+from waitress import serve
 
 # Configuration
 class Config:
@@ -32,6 +28,8 @@ class Config:
     MAX_MESSAGE_LENGTH = int(os.getenv('MAX_MESSAGE_LENGTH', 2000))
     ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    ENV = os.getenv('FLASK_ENV', 'production')
+    SECRET_KEY = os.getenv('SECRET_KEY', os.urandom(24))
 
 # Set up logging
 logging.basicConfig(
@@ -54,6 +52,8 @@ class Message:
             raise ValueError(f"Message exceeds maximum length of {Config.MAX_MESSAGE_LENGTH}")
         if not self.username:
             raise ValueError("Username cannot be empty")
+        if not self.color.startswith('#'):
+            self.color = f"#{self.color}"
 
 # HTML Templates
 HTML_BASE = """
@@ -128,6 +128,64 @@ MESSAGE_TEMPLATE = """
 </div>
 """
 
+WELCOME_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Discord Message Image Generator API</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        code {
+            background: #f4f4f4;
+            padding: 2px 5px;
+            border-radius: 3px;
+        }
+        pre {
+            background: #f4f4f4;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>Discord Message Image Generator API</h1>
+    <p>Welcome to the Discord Message Image Generator API. Use this service to generate Discord-style message images.</p>
+    
+    <h2>Endpoints:</h2>
+    <ul>
+        <li><code>GET /</code> - This documentation page</li>
+        <li><code>GET /health</code> - Health check endpoint</li>
+        <li><code>POST /generate</code> - Generate Discord message image</li>
+    </ul>
+
+    <h2>Example Usage:</h2>
+    <pre>
+POST /generate
+Content-Type: application/json
+
+{
+    "messages": [
+        {
+            "username": "User1",
+            "message": "Hello, Discord!",
+            "color": "#7289DA",
+            "timestamp": "2024-12-24 12:00",
+            "avatar_url": "https://example.com/avatar.png"
+        }
+    ]
+}
+    </pre>
+</body>
+</html>
+"""
+
 class ImageGenerator:
     def __init__(self):
         self.chrome_options = self._setup_chrome_options()
@@ -146,7 +204,7 @@ class ImageGenerator:
         message_containers = ""
         for msg in messages:
             message_containers += MESSAGE_TEMPLATE.format(
-                avatar_url=msg.avatar_url,
+                avatar_url=msg.avatar_url or "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' fill='%23666'/%3E%3C/svg%3E",
                 color=msg.color,
                 username=msg.username,
                 timestamp=msg.timestamp,
@@ -180,11 +238,14 @@ class ImageGenerator:
 
 # Initialize Flask app
 app = Flask(__name__)
+app.config['ENV'] = Config.ENV
+app.config['SECRET_KEY'] = Config.SECRET_KEY
 CORS(app, origins=Config.ALLOWED_ORIGINS)
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=[Config.RATE_LIMIT]
+    default_limits=[Config.RATE_LIMIT],
+    storage_uri="memory://"
 )
 
 image_generator = ImageGenerator()
@@ -197,9 +258,16 @@ def handle_error(error):
         'message': str(error)
     }), 500
 
+@app.route('/')
+def index():
+    return render_template_string(WELCOME_HTML)
+
 @app.route('/health')
 def health_check():
-    return jsonify({'status': 'healthy'}), 200
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat()
+    }), 200
 
 @app.route('/generate', methods=['POST'])
 @limiter.limit(Config.RATE_LIMIT)
@@ -240,6 +308,12 @@ def generate_image():
         logger.error(f"Error generating image: {str(e)}", exc_info=True)
         return jsonify({'error': 'Failed to generate image'}), 500
 
+def create_app():
+    return app
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    if Config.ENV == 'production':
+        serve(app, host='0.0.0.0', port=port)
+    else:
+        app.run(host='0.0.0.0', port=port, debug=True)
