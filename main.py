@@ -18,16 +18,21 @@ class Config:
     MAX_MESSAGE_LENGTH = int(os.getenv('MAX_MESSAGE_LENGTH', 2000))
     ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-    FONT_SIZE = 14
+    
+    # Styling configurations
+    FONT_SIZE = 16
     USERNAME_FONT_SIZE = 16
     TIMESTAMP_FONT_SIZE = 12
-    PADDING = 20
-    MESSAGE_SPACING = 20
+    PADDING = 16
+    MESSAGE_SPACING = 8
     AVATAR_SIZE = 40
     MAX_WIDTH = 800
     BACKGROUND_COLOR = '#36393f'
     DEFAULT_TEXT_COLOR = '#dcddde'
-    TIMESTAMP_COLOR = '#99aab5'
+    TIMESTAMP_COLOR = '#a3a6aa'
+    USERNAME_SPACING = 8
+    MESSAGE_TOP_PADDING = 2
+    LINE_SPACING = 4
 
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL),
@@ -56,7 +61,6 @@ class ImageGenerator:
             self.username_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", Config.USERNAME_FONT_SIZE)
             self.timestamp_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Config.TIMESTAMP_FONT_SIZE)
         except OSError:
-            # Fallback to default font if DejaVu Sans is not available
             logger.warning("DejaVu Sans fonts not found, using default font")
             self.font = ImageFont.load_default()
             self.username_font = ImageFont.load_default()
@@ -65,13 +69,23 @@ class ImageGenerator:
     def _get_avatar(self, avatar_url: str) -> Image.Image:
         try:
             if not avatar_url:
-                avatar = Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), Config.BACKGROUND_COLOR)
+                avatar = Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#7289da')
+                draw = ImageDraw.Draw(avatar)
+                draw.ellipse((0, 0, Config.AVATAR_SIZE, Config.AVATAR_SIZE), fill='#7289da')
                 return avatar
 
             response = requests.get(avatar_url, timeout=5)
             avatar = Image.open(BytesIO(response.content))
             avatar = avatar.convert('RGBA')
-            avatar = avatar.resize((Config.AVATAR_SIZE, Config.AVATAR_SIZE))
+            
+            # Ensure square aspect ratio
+            size = min(avatar.size)
+            left = (avatar.width - size) // 2
+            top = (avatar.height - size) // 2
+            avatar = avatar.crop((left, top, left + size, top + size))
+            
+            # Resize to desired size
+            avatar = avatar.resize((Config.AVATAR_SIZE, Config.AVATAR_SIZE), Image.Resampling.LANCZOS)
             
             # Create circular mask
             mask = Image.new('L', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), 0)
@@ -86,7 +100,7 @@ class ImageGenerator:
             return output
         except Exception as e:
             logger.error(f"Error fetching avatar: {str(e)}")
-            return Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), Config.BACKGROUND_COLOR)
+            return Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#7289da')
 
     def _wrap_text(self, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
         words = text.split()
@@ -94,6 +108,17 @@ class ImageGenerator:
         current_line = []
         
         for word in words:
+            # Handle newlines in messages
+            if '\n' in word:
+                subwords = word.split('\n')
+                for i, subword in enumerate(subwords):
+                    if subword:
+                        current_line.append(subword)
+                        if i < len(subwords) - 1:
+                            lines.append(' '.join(current_line))
+                            current_line = []
+                continue
+                
             current_line.append(word)
             line_width = font.getlength(' '.join(current_line))
             if line_width > max_width:
@@ -111,7 +136,7 @@ class ImageGenerator:
 
     def generate(self, messages: List[Message]) -> bytes:
         # Calculate dimensions
-        total_height = Config.PADDING * 2
+        total_height = Config.PADDING
         message_heights = []
         
         for msg in messages:
@@ -120,12 +145,16 @@ class ImageGenerator:
                 self.font,
                 Config.MAX_WIDTH - Config.AVATAR_SIZE - Config.PADDING * 3
             )
-            height = max(
-                Config.AVATAR_SIZE,
-                30 + len(wrapped_text) * (self.font.size + 4)
-            )
+            
+            # Calculate message block height
+            text_height = len(wrapped_text) * (self.font.size + Config.LINE_SPACING)
+            header_height = max(Config.USERNAME_FONT_SIZE, Config.TIMESTAMP_FONT_SIZE)
+            height = header_height + Config.MESSAGE_TOP_PADDING + text_height
+            
             message_heights.append(height)
             total_height += height + Config.MESSAGE_SPACING
+
+        total_height += Config.PADDING - Config.MESSAGE_SPACING
 
         # Create image
         img = Image.new('RGB', (Config.MAX_WIDTH, total_height), Config.BACKGROUND_COLOR)
@@ -139,18 +168,19 @@ class ImageGenerator:
             img.paste(avatar, (Config.PADDING, current_y), avatar if avatar.mode == 'RGBA' else None)
             
             # Draw username
-            username_x = Config.PADDING * 2 + Config.AVATAR_SIZE
+            content_x = Config.PADDING * 2 + Config.AVATAR_SIZE
+            username_width = self.username_font.getlength(msg.username)
             draw.text(
-                (username_x, current_y),
+                (content_x, current_y),
                 msg.username,
                 font=self.username_font,
                 fill=msg.color
             )
             
             # Draw timestamp
-            timestamp_x = username_x + self.username_font.getlength(msg.username) + 10
+            timestamp_x = content_x + username_width + Config.USERNAME_SPACING
             draw.text(
-                (timestamp_x, current_y + 4),
+                (timestamp_x, current_y + 2),
                 msg.timestamp,
                 font=self.timestamp_font,
                 fill=Config.TIMESTAMP_COLOR
@@ -160,22 +190,23 @@ class ImageGenerator:
             wrapped_text = self._wrap_text(
                 msg.message,
                 self.font,
-                Config.MAX_WIDTH - username_x - Config.PADDING
+                Config.MAX_WIDTH - content_x - Config.PADDING
             )
-            text_y = current_y + 25
+            
+            text_y = current_y + Config.USERNAME_FONT_SIZE + Config.MESSAGE_TOP_PADDING
             
             for line in wrapped_text:
                 draw.text(
-                    (username_x, text_y),
+                    (content_x, text_y),
                     line,
                     font=self.font,
                     fill=Config.DEFAULT_TEXT_COLOR
                 )
-                text_y += self.font.size + 4
+                text_y += self.font.size + Config.LINE_SPACING
             
             current_y += height + Config.MESSAGE_SPACING
 
-        # Convert to PNG
+        # Convert to PNG with optimization
         output = BytesIO()
         img.save(output, format='PNG', optimize=True)
         output.seek(0)
