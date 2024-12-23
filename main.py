@@ -6,19 +6,14 @@ from datetime import datetime
 from dataclasses import dataclass
 import tempfile
 from pathlib import Path
-import gunicorn
+import asyncio
+from playwright.async_api import async_playwright
+from io import BytesIO
 
 from flask import Flask, request, send_file, jsonify, render_template_string
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import WebDriverException
-from io import BytesIO
 from waitress import serve
 
 # Configuration
@@ -60,6 +55,7 @@ HTML_BASE = """
 <!DOCTYPE html>
 <html>
 <head>
+<meta charset="UTF-8">
 <style>
 body {
     background: #1a1a1a;
@@ -106,6 +102,7 @@ body {
     color: #dcddde;
     font-size: 0.9rem;
     line-height: 1.4;
+    white-space: pre-wrap;
 }
 </style>
 </head>
@@ -128,113 +125,52 @@ MESSAGE_TEMPLATE = """
 </div>
 """
 
-WELCOME_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Discord Message Image Generator API</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            line-height: 1.6;
-        }
-        code {
-            background: #f4f4f4;
-            padding: 2px 5px;
-            border-radius: 3px;
-        }
-        pre {
-            background: #f4f4f4;
-            padding: 15px;
-            border-radius: 5px;
-            overflow-x: auto;
-        }
-    </style>
-</head>
-<body>
-    <h1>Discord Message Image Generator API</h1>
-    <p>Welcome to the Discord Message Image Generator API. Use this service to generate Discord-style message images.</p>
-    
-    <h2>Endpoints:</h2>
-    <ul>
-        <li><code>GET /</code> - This documentation page</li>
-        <li><code>GET /health</code> - Health check endpoint</li>
-        <li><code>POST /generate</code> - Generate Discord message image</li>
-    </ul>
-
-    <h2>Example Usage:</h2>
-    <pre>
-POST /generate
-Content-Type: application/json
-
-{
-    "messages": [
-        {
-            "username": "User1",
-            "message": "Hello, Discord!",
-            "color": "#7289DA",
-            "timestamp": "2024-12-24 12:00",
-            "avatar_url": "https://example.com/avatar.png"
-        }
-    ]
-}
-    </pre>
-</body>
-</html>
-"""
-
 class ImageGenerator:
     def __init__(self):
-        self.chrome_options = self._setup_chrome_options()
+        self.playwright = None
+        self.browser = None
         
-    @staticmethod
-    def _setup_chrome_options() -> Options:
-        options = Options()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--window-size=1920,1080')
-        return options
+    async def initialize(self):
+        if not self.playwright:
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.firefox.launch()
 
-    def generate(self, messages: List[Message]) -> bytes:
+    async def cleanup(self):
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+
+    async def generate(self, messages: List[Message]) -> bytes:
+        await self.initialize()
+        
         message_containers = ""
         for msg in messages:
+            safe_message = msg.message.replace('"', '&quot;').replace("'", "&#39;")
             message_containers += MESSAGE_TEMPLATE.format(
                 avatar_url=msg.avatar_url or "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' fill='%23666'/%3E%3C/svg%3E",
                 color=msg.color,
                 username=msg.username,
                 timestamp=msg.timestamp,
-                message=msg.message
+                message=safe_message
             )
         
         html_content = HTML_BASE.format(message_containers=message_containers)
         
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
-            f.write(html_content)
-            temp_path = f.name
-        
-        try:
-            driver = webdriver.Chrome(options=self.chrome_options)
-            driver.get(f'file://{temp_path}')
+        async with self.browser.new_context(viewport={'width': 1920, 'height': 1080}) as context:
+            page = await context.new_page()
+            await page.set_content(html_content)
             
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located(('tag name', 'body'))
-            )
+            # Wait for any images to load
+            await page.wait_for_load_state('networkidle')
             
-            body = driver.find_element('tag name', 'body')
-            screenshot = body.screenshot_as_png
+            # Get the body element and its dimensions
+            body = await page.query_selector('body')
+            box = await body.bounding_box()
             
+            # Take screenshot of the body element
+            screenshot = await body.screenshot(type='png')
             return screenshot
-        except WebDriverException as e:
-            logger.error(f"WebDriver error: {str(e)}")
-            raise
-        finally:
-            driver.quit()
-            os.unlink(temp_path)
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -248,6 +184,7 @@ limiter = Limiter(
     storage_uri="memory://"
 )
 
+# Create a single ImageGenerator instance
 image_generator = ImageGenerator()
 
 @app.errorhandler(Exception)
@@ -260,7 +197,14 @@ def handle_error(error):
 
 @app.route('/')
 def index():
-    return render_template_string(WELCOME_HTML)
+    return jsonify({
+        'status': 'ok',
+        'endpoints': {
+            '/': 'API information',
+            '/health': 'Health check endpoint',
+            '/generate': 'Generate Discord-style message images (POST)'
+        }
+    })
 
 @app.route('/health')
 def health_check():
@@ -271,7 +215,7 @@ def health_check():
 
 @app.route('/generate', methods=['POST'])
 @limiter.limit(Config.RATE_LIMIT)
-def generate_image():
+async def generate_image():
     try:
         data = request.get_json()
         if not data or 'messages' not in data:
@@ -295,7 +239,7 @@ def generate_image():
             except (KeyError, ValueError) as e:
                 return jsonify({'error': f'Invalid message data: {str(e)}'}), 400
 
-        screenshot = image_generator.generate(messages)
+        screenshot = await image_generator.generate(messages)
 
         return send_file(
             BytesIO(screenshot),
@@ -307,6 +251,14 @@ def generate_image():
     except Exception as e:
         logger.error(f"Error generating image: {str(e)}", exc_info=True)
         return jsonify({'error': 'Failed to generate image'}), 500
+
+@app.before_first_request
+async def setup_image_generator():
+    await image_generator.initialize()
+
+@app.teardown_appcontext
+async def cleanup_image_generator(exception):
+    await image_generator.cleanup()
 
 def create_app():
     return app
