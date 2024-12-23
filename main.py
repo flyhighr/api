@@ -1,29 +1,16 @@
-"""
-Discord Message Image Generator
-A production-ready Flask application for generating Discord-style message images.
-Simplified for easy deployment on Render.
-"""
-
 import os
 import json
 import logging
 from typing import List, Dict, Any
 from datetime import datetime
 from dataclasses import dataclass
-import tempfile
-from pathlib import Path
-
+from io import BytesIO
+import requests
+from PIL import Image, ImageDraw, ImageFont
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import WebDriverException
-from io import BytesIO
 
 # Configuration
 class Config:
@@ -32,6 +19,13 @@ class Config:
     MAX_MESSAGE_LENGTH = int(os.getenv('MAX_MESSAGE_LENGTH', 2000))
     ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    FONT_SIZE = 14
+    USERNAME_FONT_SIZE = 16
+    TIMESTAMP_FONT_SIZE = 12
+    PADDING = 20
+    MESSAGE_SPACING = 20
+    AVATAR_SIZE = 40
+    MAX_WIDTH = 800
 
 # Set up logging
 logging.basicConfig(
@@ -40,7 +34,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Message validation class
 @dataclass
 class Message:
     username: str
@@ -55,128 +48,111 @@ class Message:
         if not self.username:
             raise ValueError("Username cannot be empty")
 
-# HTML Templates
-HTML_BASE = """
-<!DOCTYPE html>
-<html>
-<head>
-<style>
-body {
-    background: #1a1a1a;
-    font-family: Arial, sans-serif;
-    color: #fff;
-    padding: 20px;
-    margin: 0;
-    width: fit-content;
-}
-.message-container {
-    margin-bottom: 20px;
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-}
-.avatar {
-    width: 40px;
-    height: 40px;
-    border-radius: 50%;
-    background-size: cover;
-    background-position: center;
-    flex-shrink: 0;
-}
-.message-content {
-    flex-grow: 1;
-    max-width: 800px;
-    word-wrap: break-word;
-}
-.username {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 4px;
-}
-.username-text {
-    font-size: 1rem;
-    font-weight: 500;
-}
-.timestamp {
-    color: #999;
-    font-size: 0.75rem;
-}
-.message-text {
-    color: #dcddde;
-    font-size: 0.9rem;
-    line-height: 1.4;
-}
-</style>
-</head>
-<body>
-{message_containers}
-</body>
-</html>
-"""
-
-MESSAGE_TEMPLATE = """
-<div class="message-container">
-    <div class="avatar" style="background-image: url('{avatar_url}')"></div>
-    <div class="message-content">
-        <div class="username">
-            <span class="username-text" style="color: {color}">{username}</span>
-            <span class="timestamp">{timestamp}</span>
-        </div>
-        <div class="message-text">{message}</div>
-    </div>
-</div>
-"""
-
 class ImageGenerator:
     def __init__(self):
-        self.chrome_options = self._setup_chrome_options()
+        # Load fonts - you'll need to provide appropriate font files
+        self.font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Config.FONT_SIZE)
+        self.username_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", Config.USERNAME_FONT_SIZE)
+        self.timestamp_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Config.TIMESTAMP_FONT_SIZE)
+
+    def _get_avatar(self, avatar_url: str) -> Image.Image:
+        """Fetch and process avatar image"""
+        try:
+            if not avatar_url:
+                # Create default avatar
+                avatar = Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#36393f')
+                return avatar
+
+            response = requests.get(avatar_url)
+            avatar = Image.open(BytesIO(response.content))
+            avatar = avatar.resize((Config.AVATAR_SIZE, Config.AVATAR_SIZE))
+            
+            # Create circular mask
+            mask = Image.new('L', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.ellipse((0, 0, Config.AVATAR_SIZE, Config.AVATAR_SIZE), fill=255)
+            
+            output = Image.new('RGBA', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), (0, 0, 0, 0))
+            output.paste(avatar, (0, 0))
+            output.putalpha(mask)
+            
+            return output
+        except Exception as e:
+            logger.error(f"Error fetching avatar: {str(e)}")
+            return Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#36393f')
+
+    def _wrap_text(self, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
+        """Wrap text to fit within specified width"""
+        words = text.split()
+        lines = []
+        current_line = []
         
-    @staticmethod
-    def _setup_chrome_options() -> Options:
-        options = Options()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--window-size=1920,1080')
-        return options
+        for word in words:
+            current_line.append(word)
+            line_width = font.getlength(' '.join(current_line))
+            if line_width > max_width:
+                if len(current_line) == 1:
+                    lines.append(current_line[0])
+                    current_line = []
+                else:
+                    current_line.pop()
+                    lines.append(' '.join(current_line))
+                    current_line = [word]
+        
+        if current_line:
+            lines.append(' '.join(current_line))
+        return lines
 
     def generate(self, messages: List[Message]) -> bytes:
-        message_containers = ""
+        # Calculate total height needed
+        total_height = Config.PADDING * 2
+        message_heights = []
+        
         for msg in messages:
-            message_containers += MESSAGE_TEMPLATE.format(
-                avatar_url=msg.avatar_url,
-                color=msg.color,
-                username=msg.username,
-                timestamp=msg.timestamp,
-                message=msg.message
-            )
+            wrapped_text = self._wrap_text(msg.message, self.font, Config.MAX_WIDTH - Config.AVATAR_SIZE - 40)
+            height = max(Config.AVATAR_SIZE, 
+                        30 + len(wrapped_text) * (self.font.size + 4))  # Username + message lines
+            message_heights.append(height)
+            total_height += height + Config.MESSAGE_SPACING
+
+        # Create image
+        img = Image.new('RGB', (Config.MAX_WIDTH, total_height), '#36393f')
+        draw = ImageDraw.Draw(img)
         
-        html_content = HTML_BASE.format(message_containers=message_containers)
+        current_y = Config.PADDING
         
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
-            f.write(html_content)
-            temp_path = f.name
-        
-        try:
-            driver = webdriver.Chrome(options=self.chrome_options)
-            driver.get(f'file://{temp_path}')
+        for msg, height in zip(messages, message_heights):
+            # Draw avatar
+            avatar = self._get_avatar(msg.avatar_url)
+            img.paste(avatar, (Config.PADDING, current_y), avatar if avatar.mode == 'RGBA' else None)
             
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located(('tag name', 'body'))
-            )
+            # Draw username
+            username_x = Config.PADDING + Config.AVATAR_SIZE + 10
+            draw.text((username_x, current_y), msg.username, 
+                     font=self.username_font, fill=msg.color)
             
-            body = driver.find_element('tag name', 'body')
-            screenshot = body.screenshot_as_png
+            # Draw timestamp
+            timestamp_width = self.timestamp_font.getlength(msg.timestamp)
+            draw.text((username_x + self.username_font.getlength(msg.username) + 10, 
+                      current_y + 4), msg.timestamp, 
+                     font=self.timestamp_font, fill='#99aab5')
             
-            return screenshot
-        except WebDriverException as e:
-            logger.error(f"WebDriver error: {str(e)}")
-            raise
-        finally:
-            driver.quit()
-            os.unlink(temp_path)
+            # Draw message
+            wrapped_text = self._wrap_text(msg.message, self.font, 
+                                         Config.MAX_WIDTH - username_x - Config.PADDING)
+            text_y = current_y + 25
+            for line in wrapped_text:
+                draw.text((username_x, text_y), line, 
+                         font=self.font, fill='#dcddde')
+                text_y += self.font.size + 4
+            
+            current_y += height + Config.MESSAGE_SPACING
+
+        # Convert to PNG
+        output = BytesIO()
+        img.save(output, format='PNG')
+        output.seek(0)
+        return output.getvalue()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -189,13 +165,16 @@ limiter = Limiter(
 
 image_generator = ImageGenerator()
 
-@app.errorhandler(Exception)
-def handle_error(error):
-    logger.error(f"Error occurred: {str(error)}", exc_info=True)
+@app.route('/')
+def index():
     return jsonify({
-        'error': 'Internal server error',
-        'message': str(error)
-    }), 500
+        'status': 'running',
+        'endpoints': {
+            '/': 'This documentation',
+            '/health': 'Health check endpoint',
+            '/generate': 'POST endpoint for generating Discord-style message images'
+        }
+    })
 
 @app.route('/health')
 def health_check():
