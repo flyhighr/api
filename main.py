@@ -1,24 +1,24 @@
 import os
 import json
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from datetime import datetime
 from dataclasses import dataclass
 import tempfile
 from pathlib import Path
 import asyncio
-from playwright.async_api import async_playwright
 from io import BytesIO
+import aiohttp
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
 
-from flask import Flask, request, send_file, jsonify, render_template_string
+from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from waitress import serve
-# Import required for async support
-from asgiref.wsgi import WsgiToAsgi
 from hypercorn.config import Config as HyperConfig
 from hypercorn.asyncio import serve as hypercorn_serve
+from asgiref.wsgi import WsgiToAsgi
 
 # Configuration
 class Config:
@@ -29,6 +29,18 @@ class Config:
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
     ENV = os.getenv('FLASK_ENV', 'production')
     SECRET_KEY = os.getenv('SECRET_KEY', os.urandom(24))
+    
+    # Image generation config
+    FONT_SIZE = 14
+    USERNAME_FONT_SIZE = 16
+    TIMESTAMP_FONT_SIZE = 12
+    MESSAGE_PADDING = 20
+    AVATAR_SIZE = 40
+    MESSAGE_SPACING = 16
+    MAX_WIDTH = 800
+    BACKGROUND_COLOR = (32, 34, 37)  # Discord dark theme
+    TEXT_COLOR = (220, 221, 222)     # Discord message text color
+    TIMESTAMP_COLOR = (114, 118, 125) # Discord timestamp color
 
 # Set up logging
 logging.basicConfig(
@@ -37,7 +49,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Message validation class
 @dataclass
 class Message:
     username: str
@@ -53,132 +64,183 @@ class Message:
             raise ValueError("Username cannot be empty")
         if not self.color.startswith('#'):
             self.color = f"#{self.color}"
-
-# HTML Templates
-HTML_BASE = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<style>
-body {
-    background: #1a1a1a;
-    font-family: Arial, sans-serif;
-    color: #fff;
-    padding: 20px;
-    margin: 0;
-    width: fit-content;
-}
-.message-container {
-    margin-bottom: 20px;
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-}
-.avatar {
-    width: 40px;
-    height: 40px;
-    border-radius: 50%;
-    background-size: cover;
-    background-position: center;
-    flex-shrink: 0;
-}
-.message-content {
-    flex-grow: 1;
-    max-width: 800px;
-    word-wrap: break-word;
-}
-.username {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 4px;
-}
-.username-text {
-    font-size: 1rem;
-    font-weight: 500;
-}
-.timestamp {
-    color: #999;
-    font-size: 0.75rem;
-}
-.message-text {
-    color: #dcddde;
-    font-size: 0.9rem;
-    line-height: 1.4;
-    white-space: pre-wrap;
-}
-</style>
-</head>
-<body>
-{message_containers}
-</body>
-</html>
-"""
-
-MESSAGE_TEMPLATE = """
-<div class="message-container">
-    <div class="avatar" style="background-image: url('{avatar_url}')"></div>
-    <div class="message-content">
-        <div class="username">
-            <span class="username-text" style="color: {color}">{username}</span>
-            <span class="timestamp">{timestamp}</span>
-        </div>
-        <div class="message-text">{message}</div>
-    </div>
-</div>
-"""
+            
+    def get_color_rgb(self) -> Tuple[int, int, int]:
+        color = self.color.lstrip('#')
+        return tuple(int(color[i:i+2], 16) for i in (0, 2, 4))
 
 class ImageGenerator:
     def __init__(self):
-        self.playwright = None
-        self.browser = None
-        self._initialized = False
+        # Load fonts
+        self.font_path = os.path.join(os.path.dirname(__file__), 'fonts', 'Roboto-Regular.ttf')
+        self.font_bold_path = os.path.join(os.path.dirname(__file__), 'fonts', 'Roboto-Bold.ttf')
         
-    async def initialize(self):
-        if not self._initialized:
-            self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.firefox.launch()
-            self._initialized = True
-
-    async def cleanup(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-        self._initialized = False
-
+        # Create fonts directory if it doesn't exist
+        os.makedirs(os.path.dirname(self.font_path), exist_ok=True)
+        
+        # Download fonts if they don't exist
+        if not os.path.exists(self.font_path):
+            self._download_fonts()
+            
+        self.font = ImageFont.truetype(self.font_path, Config.FONT_SIZE)
+        self.username_font = ImageFont.truetype(self.font_bold_path, Config.USERNAME_FONT_SIZE)
+        self.timestamp_font = ImageFont.truetype(self.font_path, Config.TIMESTAMP_FONT_SIZE)
+        
+        # Create default avatar
+        self.default_avatar = self._create_default_avatar()
+        
+    def _create_default_avatar(self) -> Image.Image:
+        """Create a default avatar image"""
+        avatar = Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), (102, 102, 102))
+        return avatar
+        
+    async def _download_fonts(self):
+        """Download required fonts"""
+        async with aiohttp.ClientSession() as session:
+            # Download Roboto Regular
+            async with session.get('https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Regular.ttf') as resp:
+                with open(self.font_path, 'wb') as f:
+                    f.write(await resp.read())
+                    
+            # Download Roboto Bold
+            async with session.get('https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Bold.ttf') as resp:
+                with open(self.font_bold_path, 'wb') as f:
+                    f.write(await resp.read())
+    
+    async def _get_avatar(self, avatar_url: str) -> Image.Image:
+        """Fetch and process avatar image"""
+        if not avatar_url:
+            return self.default_avatar
+            
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(avatar_url) as response:
+                    if response.status == 200:
+                        data = await response.read()
+                        avatar = Image.open(BytesIO(data))
+                        avatar = avatar.convert('RGB')
+                        avatar = avatar.resize((Config.AVATAR_SIZE, Config.AVATAR_SIZE), Image.Resampling.LANCZOS)
+                        return avatar
+                    else:
+                        return self.default_avatar
+        except Exception as e:
+            logger.error(f"Error fetching avatar: {str(e)}")
+            return self.default_avatar
+            
+    def _wrap_text(self, text: str, draw: ImageDraw.ImageDraw, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
+        """Wrap text to fit within maximum width"""
+        words = text.split()
+        lines = []
+        current_line = []
+        
+        for word in words:
+            test_line = ' '.join(current_line + [word])
+            width = draw.textlength(test_line, font=font)
+            
+            if width <= max_width:
+                current_line.append(word)
+            else:
+                if current_line:
+                    lines.append(' '.join(current_line))
+                current_line = [word]
+                
+        if current_line:
+            lines.append(' '.join(current_line))
+            
+        return lines
+        
     async def generate(self, messages: List[Message]) -> bytes:
-        if not self._initialized:
-            await self.initialize()
-        
-        message_containers = ""
-        for msg in messages:
-            safe_message = msg.message.replace('"', '&quot;').replace("'", "&#39;")
-            message_containers += MESSAGE_TEMPLATE.format(
-                avatar_url=msg.avatar_url or "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' fill='%23666'/%3E%3C/svg%3E",
-                color=msg.color,
-                username=msg.username,
-                timestamp=msg.timestamp,
-                message=safe_message
-            )
-        
-        html_content = HTML_BASE.format(message_containers=message_containers)
-        
-        async with self.browser.new_context(viewport={'width': 1920, 'height': 1080}) as context:
-            page = await context.new_page()
-            await page.set_content(html_content)
+        """Generate image from messages"""
+        try:
+            # Calculate total height needed
+            total_height = Config.MESSAGE_PADDING
+            message_heights = []
             
-            # Wait for any images to load
-            await page.wait_for_load_state('networkidle')
+            # Create a temporary image for text measurements
+            temp_img = Image.new('RGB', (1, 1))
+            draw = ImageDraw.Draw(temp_img)
             
-            # Get the body element and its dimensions
-            body = await page.query_selector('body')
-            box = await body.bounding_box()
+            for message in messages:
+                # Calculate wrapped text height
+                wrapped_lines = self._wrap_text(
+                    message.message, 
+                    draw, 
+                    self.font,
+                    Config.MAX_WIDTH - Config.MESSAGE_PADDING * 2 - Config.AVATAR_SIZE - Config.MESSAGE_SPACING
+                )
+                
+                message_height = (
+                    Config.USERNAME_FONT_SIZE +  # Username height
+                    len(wrapped_lines) * (Config.FONT_SIZE + 4) +  # Message text height
+                    Config.MESSAGE_SPACING  # Spacing
+                )
+                
+                message_heights.append(message_height)
+                total_height += message_height
+                
+            # Create final image
+            img = Image.new('RGB', (Config.MAX_WIDTH, total_height), Config.BACKGROUND_COLOR)
+            draw = ImageDraw.Draw(img)
             
-            # Take screenshot of the body element
-            screenshot = await body.screenshot(type='png')
-            return screenshot
+            # Current Y position for drawing
+            current_y = Config.MESSAGE_PADDING
+            
+            # Draw messages
+            for i, message in enumerate(messages):
+                # Get avatar
+                avatar = await self._get_avatar(message.avatar_url)
+                
+                # Paste avatar
+                img.paste(avatar, (Config.MESSAGE_PADDING, current_y))
+                
+                # Draw username
+                username_x = Config.MESSAGE_PADDING + Config.AVATAR_SIZE + Config.MESSAGE_SPACING
+                draw.text(
+                    (username_x, current_y),
+                    message.username,
+                    font=self.username_font,
+                    fill=message.get_color_rgb()
+                )
+                
+                # Draw timestamp
+                timestamp_width = draw.textlength(message.timestamp, font=self.timestamp_font)
+                draw.text(
+                    (username_x + draw.textlength(message.username, font=self.username_font) + 10, current_y + 4),
+                    message.timestamp,
+                    font=self.timestamp_font,
+                    fill=Config.TIMESTAMP_COLOR
+                )
+                
+                # Draw message text
+                wrapped_lines = self._wrap_text(
+                    message.message,
+                    draw,
+                    self.font,
+                    Config.MAX_WIDTH - Config.MESSAGE_PADDING * 2 - Config.AVATAR_SIZE - Config.MESSAGE_SPACING
+                )
+                
+                text_y = current_y + Config.USERNAME_FONT_SIZE + 4
+                for line in wrapped_lines:
+                    draw.text(
+                        (username_x, text_y),
+                        line,
+                        font=self.font,
+                        fill=Config.TEXT_COLOR
+                    )
+                    text_y += Config.FONT_SIZE + 4
+                
+                current_y += message_heights[i]
+            
+            # Convert to bytes
+            img_byte_arr = BytesIO()
+            img.save(img_byte_arr, format='PNG', optimize=True)
+            img_byte_arr.seek(0)
+            
+            return img_byte_arr.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error generating image: {str(e)}", exc_info=True)
+            raise
 
 def create_app():
     app = Flask(__name__)
@@ -192,10 +254,10 @@ def create_app():
         default_limits=[Config.RATE_LIMIT],
         storage_uri="memory://"
     )
-
-    # Create a single ImageGenerator instance
+    
+    # Create image generator instance
     image_generator = ImageGenerator()
-
+    
     @app.errorhandler(Exception)
     def handle_error(error):
         logger.error(f"Error occurred: {str(error)}", exc_info=True)
@@ -203,7 +265,7 @@ def create_app():
             'error': 'Internal server error',
             'message': str(error)
         }), 500
-
+        
     @app.route('/')
     def index():
         return jsonify({
@@ -214,14 +276,14 @@ def create_app():
                 '/generate': 'Generate Discord-style message images (POST)'
             }
         })
-
+        
     @app.route('/health')
     def health_check():
         return jsonify({
             'status': 'healthy',
             'timestamp': datetime.now().isoformat()
         }), 200
-
+        
     @app.route('/generate', methods=['POST'])
     @limiter.limit(Config.RATE_LIMIT)
     async def generate_image():
@@ -229,10 +291,10 @@ def create_app():
             data = request.get_json()
             if not data or 'messages' not in data:
                 return jsonify({'error': 'Invalid request data'}), 400
-
+                
             if len(data['messages']) > Config.MAX_MESSAGES:
                 return jsonify({'error': f'Too many messages. Maximum allowed: {Config.MAX_MESSAGES}'}), 400
-
+                
             messages = []
             for msg_data in data['messages']:
                 try:
@@ -247,20 +309,20 @@ def create_app():
                     messages.append(message)
                 except (KeyError, ValueError) as e:
                     return jsonify({'error': f'Invalid message data: {str(e)}'}), 400
-
+                    
             screenshot = await image_generator.generate(messages)
-
+            
             return send_file(
                 BytesIO(screenshot),
                 mimetype='image/png',
                 as_attachment=True,
                 download_name='discord_messages.png'
             )
-
+            
         except Exception as e:
             logger.error(f"Error generating image: {str(e)}", exc_info=True)
-            return jsonify({'error': 'Failed to generate image'}), 500
-
+            return jsonify({'error': 'Failed to generate image', 'details': str(e)}), 500
+            
     return app
 
 async def run_app():
