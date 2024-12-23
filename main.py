@@ -12,7 +12,6 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-# Configuration
 class Config:
     RATE_LIMIT = os.getenv('RATE_LIMIT', '100 per hour')
     MAX_MESSAGES = int(os.getenv('MAX_MESSAGES', 50))
@@ -26,8 +25,10 @@ class Config:
     MESSAGE_SPACING = 20
     AVATAR_SIZE = 40
     MAX_WIDTH = 800
+    BACKGROUND_COLOR = '#36393f'
+    DEFAULT_TEXT_COLOR = '#dcddde'
+    TIMESTAMP_COLOR = '#99aab5'
 
-# Set up logging
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -50,28 +51,34 @@ class Message:
 
 class ImageGenerator:
     def __init__(self):
-        # Load fonts - you'll need to provide appropriate font files
-        self.font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Config.FONT_SIZE)
-        self.username_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", Config.USERNAME_FONT_SIZE)
-        self.timestamp_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Config.TIMESTAMP_FONT_SIZE)
+        try:
+            self.font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Config.FONT_SIZE)
+            self.username_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", Config.USERNAME_FONT_SIZE)
+            self.timestamp_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", Config.TIMESTAMP_FONT_SIZE)
+        except OSError:
+            # Fallback to default font if DejaVu Sans is not available
+            logger.warning("DejaVu Sans fonts not found, using default font")
+            self.font = ImageFont.load_default()
+            self.username_font = ImageFont.load_default()
+            self.timestamp_font = ImageFont.load_default()
 
     def _get_avatar(self, avatar_url: str) -> Image.Image:
-        """Fetch and process avatar image"""
         try:
             if not avatar_url:
-                # Create default avatar
-                avatar = Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#36393f')
+                avatar = Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), Config.BACKGROUND_COLOR)
                 return avatar
 
-            response = requests.get(avatar_url)
+            response = requests.get(avatar_url, timeout=5)
             avatar = Image.open(BytesIO(response.content))
+            avatar = avatar.convert('RGBA')
             avatar = avatar.resize((Config.AVATAR_SIZE, Config.AVATAR_SIZE))
             
             # Create circular mask
             mask = Image.new('L', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), 0)
-            draw = ImageDraw.Draw(mask)
-            draw.ellipse((0, 0, Config.AVATAR_SIZE, Config.AVATAR_SIZE), fill=255)
+            mask_draw = ImageDraw.Draw(mask)
+            mask_draw.ellipse((0, 0, Config.AVATAR_SIZE, Config.AVATAR_SIZE), fill=255)
             
+            # Apply mask
             output = Image.new('RGBA', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), (0, 0, 0, 0))
             output.paste(avatar, (0, 0))
             output.putalpha(mask)
@@ -79,10 +86,9 @@ class ImageGenerator:
             return output
         except Exception as e:
             logger.error(f"Error fetching avatar: {str(e)}")
-            return Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), '#36393f')
+            return Image.new('RGB', (Config.AVATAR_SIZE, Config.AVATAR_SIZE), Config.BACKGROUND_COLOR)
 
     def _wrap_text(self, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
-        """Wrap text to fit within specified width"""
         words = text.split()
         lines = []
         current_line = []
@@ -104,19 +110,25 @@ class ImageGenerator:
         return lines
 
     def generate(self, messages: List[Message]) -> bytes:
-        # Calculate total height needed
+        # Calculate dimensions
         total_height = Config.PADDING * 2
         message_heights = []
         
         for msg in messages:
-            wrapped_text = self._wrap_text(msg.message, self.font, Config.MAX_WIDTH - Config.AVATAR_SIZE - 40)
-            height = max(Config.AVATAR_SIZE, 
-                        30 + len(wrapped_text) * (self.font.size + 4))  # Username + message lines
+            wrapped_text = self._wrap_text(
+                msg.message,
+                self.font,
+                Config.MAX_WIDTH - Config.AVATAR_SIZE - Config.PADDING * 3
+            )
+            height = max(
+                Config.AVATAR_SIZE,
+                30 + len(wrapped_text) * (self.font.size + 4)
+            )
             message_heights.append(height)
             total_height += height + Config.MESSAGE_SPACING
 
         # Create image
-        img = Image.new('RGB', (Config.MAX_WIDTH, total_height), '#36393f')
+        img = Image.new('RGB', (Config.MAX_WIDTH, total_height), Config.BACKGROUND_COLOR)
         draw = ImageDraw.Draw(img)
         
         current_y = Config.PADDING
@@ -127,30 +139,45 @@ class ImageGenerator:
             img.paste(avatar, (Config.PADDING, current_y), avatar if avatar.mode == 'RGBA' else None)
             
             # Draw username
-            username_x = Config.PADDING + Config.AVATAR_SIZE + 10
-            draw.text((username_x, current_y), msg.username, 
-                     font=self.username_font, fill=msg.color)
+            username_x = Config.PADDING * 2 + Config.AVATAR_SIZE
+            draw.text(
+                (username_x, current_y),
+                msg.username,
+                font=self.username_font,
+                fill=msg.color
+            )
             
             # Draw timestamp
-            timestamp_width = self.timestamp_font.getlength(msg.timestamp)
-            draw.text((username_x + self.username_font.getlength(msg.username) + 10, 
-                      current_y + 4), msg.timestamp, 
-                     font=self.timestamp_font, fill='#99aab5')
+            timestamp_x = username_x + self.username_font.getlength(msg.username) + 10
+            draw.text(
+                (timestamp_x, current_y + 4),
+                msg.timestamp,
+                font=self.timestamp_font,
+                fill=Config.TIMESTAMP_COLOR
+            )
             
             # Draw message
-            wrapped_text = self._wrap_text(msg.message, self.font, 
-                                         Config.MAX_WIDTH - username_x - Config.PADDING)
+            wrapped_text = self._wrap_text(
+                msg.message,
+                self.font,
+                Config.MAX_WIDTH - username_x - Config.PADDING
+            )
             text_y = current_y + 25
+            
             for line in wrapped_text:
-                draw.text((username_x, text_y), line, 
-                         font=self.font, fill='#dcddde')
+                draw.text(
+                    (username_x, text_y),
+                    line,
+                    font=self.font,
+                    fill=Config.DEFAULT_TEXT_COLOR
+                )
                 text_y += self.font.size + 4
             
             current_y += height + Config.MESSAGE_SPACING
 
         # Convert to PNG
         output = BytesIO()
-        img.save(output, format='PNG')
+        img.save(output, format='PNG', optimize=True)
         output.seek(0)
         return output.getvalue()
 
@@ -169,8 +196,9 @@ image_generator = ImageGenerator()
 def index():
     return jsonify({
         'status': 'running',
+        'version': '1.0.0',
         'endpoints': {
-            '/': 'This documentation',
+            '/': 'API documentation',
             '/health': 'Health check endpoint',
             '/generate': 'POST endpoint for generating Discord-style message images'
         }
@@ -189,7 +217,9 @@ def generate_image():
             return jsonify({'error': 'Invalid request data'}), 400
 
         if len(data['messages']) > Config.MAX_MESSAGES:
-            return jsonify({'error': f'Too many messages. Maximum allowed: {Config.MAX_MESSAGES}'}), 400
+            return jsonify({
+                'error': f'Too many messages. Maximum allowed: {Config.MAX_MESSAGES}'
+            }), 400
 
         messages = []
         for msg_data in data['messages']:
