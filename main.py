@@ -58,7 +58,7 @@ async def get_share_url(conversation_id: str):
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
     
-    base_url = "https://your-frontend-url.com/view"  # Update this with your actual frontend URL
+    base_url = "https://flyhighr.github.io/archive/view"  # Update this with your actual frontend URL
     share_url = f"{base_url}?id={conversation_id}"
     
     # Update the share URL in the database
