@@ -4,14 +4,13 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
-import uuid
 
 app = FastAPI(title="Discord Archive API")
 
 # CORS Setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update this with your frontend URL in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,9 +38,9 @@ class Conversation(BaseModel):
     channel_id: str
 
 # Routes
-@app.post("/conversations/", response_model=dict)
+@app.post("/conversations/")
 async def create_conversation(conversation: Conversation):
-    conversation_dict = conversation.dict()
+    conversation_dict = conversation.model_dump()  # Updated from .dict()
     await db.conversations.insert_one(conversation_dict)
     return {"conversation_id": conversation.conversation_id}
 
@@ -50,18 +49,25 @@ async def get_conversation(conversation_id: str):
     conversation = await db.conversations.find_one({"conversation_id": conversation_id})
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    conversation["_id"] = str(conversation["_id"])  # Convert ObjectId to string
+    conversation["_id"] = str(conversation["_id"])
     return conversation
 
-@app.patch("/conversations/{conversation_id}/share-url")
-async def update_share_url(conversation_id: str, share_url: str):
-    result = await db.conversations.update_one(
+@app.get("/conversations/{conversation_id}/share-url")  # Changed from PATCH to GET
+async def get_share_url(conversation_id: str):
+    conversation = await db.conversations.find_one({"conversation_id": conversation_id})
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    base_url = "https://your-frontend-url.com/view"  # Update this with your actual frontend URL
+    share_url = f"{base_url}?id={conversation_id}"
+    
+    # Update the share URL in the database
+    await db.conversations.update_one(
         {"conversation_id": conversation_id},
         {"$set": {"share_url": share_url}}
     )
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return {"status": "success"}
+    
+    return {"share_url": share_url}
 
 if __name__ == "__main__":
     import uvicorn
