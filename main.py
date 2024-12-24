@@ -4,22 +4,23 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import logging
+import asyncio
+from contextlib import asynccontextmanager
+import signal
+import sys
+from logging.handlers import RotatingFileHandler
 
-app = FastAPI(title="Discord Archive API")
-
-# CORS Setup
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler('api.log', maxBytes=10000000, backupCount=5),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-
-# MongoDB Setup
-MONGODB_URL = "mongodb+srv://flyhigh:Shekhar9330@cluster0.0dqoh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
-client = AsyncIOMotorClient(MONGODB_URL)
-db = client.discord_archives
+logger = logging.getLogger(__name__)
 
 # Models
 class ReactionUser(BaseModel):
@@ -63,42 +64,136 @@ class Conversation(BaseModel):
     guild_id: str
     channel_id: str
 
-# Routes
+# Database connection management
+class Database:
+    client: Optional[AsyncIOMotorClient] = None
+    db = None
+
+    @classmethod
+    async def connect_db(cls):
+        try:
+            logger.info("Connecting to MongoDB...")
+            cls.client = AsyncIOMotorClient(
+                "mongodb+srv://flyhigh:Shekhar9330@cluster0.0dqoh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0",
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=10000
+            )
+            cls.db = cls.client.discord_archives
+            await cls.client.admin.command('ping')
+            logger.info("Successfully connected to MongoDB")
+        except Exception as e:
+            logger.error(f"Failed to connect to MongoDB: {e}")
+            raise
+
+    @classmethod
+    async def close_db(cls):
+        if cls.client:
+            logger.info("Closing MongoDB connection...")
+            cls.client.close()
+            logger.info("MongoDB connection closed")
+
+# Lifecycle management
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await Database.connect_db()
+    
+    # Handle shutdown signals
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}")
+        asyncio.create_task(shutdown())
+
+    async def shutdown():
+        logger.info("Initiating graceful shutdown...")
+        await Database.close_db()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    yield
+    
+    # Cleanup
+    await Database.close_db()
+
+# FastAPI app initialization
+app = FastAPI(
+    title="Discord Archive API",
+    lifespan=lifespan
+)
+
+# CORS Setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Error handling middleware
+@app.middleware("http")
+async def error_handling_middleware(request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        logger.error(f"Unhandled error: {str(e)}")
+        return HTTPException(status_code=500, detail="Internal server error")
+
+# Routes with error handling and logging
 @app.post("/conversations/")
 async def create_conversation(conversation: Conversation):
-    conversation_dict = conversation.model_dump()
-    await db.conversations.insert_one(conversation_dict)
-    return {"conversation_id": conversation.conversation_id}
+    try:
+        conversation_dict = conversation.model_dump()
+        await Database.db.conversations.insert_one(conversation_dict)
+        logger.info(f"Created conversation: {conversation.conversation_id}")
+        return {"conversation_id": conversation.conversation_id}
+    except Exception as e:
+        logger.error(f"Error creating conversation: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create conversation")
 
 @app.get("/conversations/{conversation_id}")
 async def get_conversation(conversation_id: str):
-    conversation = await db.conversations.find_one({"conversation_id": conversation_id})
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    
-    # Convert ObjectId to string
-    conversation["_id"] = str(conversation["_id"])
-    
-    # Sort messages by timestamp
-    conversation["messages"].sort(key=lambda x: x["timestamp"])
-    
-    return conversation
+    try:
+        conversation = await Database.db.conversations.find_one({"conversation_id": conversation_id})
+        if not conversation:
+            logger.warning(f"Conversation not found: {conversation_id}")
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        conversation["_id"] = str(conversation["_id"])
+        conversation["messages"].sort(key=lambda x: x["timestamp"])
+        
+        return conversation
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving conversation {conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve conversation")
 
 @app.get("/conversations/{conversation_id}/share-url")
 async def get_share_url(conversation_id: str):
-    conversation = await db.conversations.find_one({"conversation_id": conversation_id})
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    
-    base_url = "https://flyhighr.github.io/archive/"
-    share_url = f"{base_url}?id={conversation_id}"
-    
-    await db.conversations.update_one(
-        {"conversation_id": conversation_id},
-        {"$set": {"share_url": share_url}}
-    )
-    
-    return {"share_url": share_url}
+    try:
+        conversation = await Database.db.conversations.find_one({"conversation_id": conversation_id})
+        if not conversation:
+            logger.warning(f"Conversation not found: {conversation_id}")
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        base_url = "https://flyhighr.github.io/archive/"
+        share_url = f"{base_url}?id={conversation_id}"
+        
+        await Database.db.conversations.update_one(
+            {"conversation_id": conversation_id},
+            {"$set": {"share_url": share_url}}
+        )
+        
+        logger.info(f"Generated share URL for conversation: {conversation_id}")
+        return {"share_url": share_url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating share URL for conversation {conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate share URL")
 
 @app.get("/conversations")
 async def list_conversations(
@@ -107,19 +202,41 @@ async def list_conversations(
     limit: int = 10,
     skip: int = 0
 ):
-    query = {}
-    if guild_id:
-        query["guild_id"] = guild_id
-    if channel_id:
-        query["channel_id"] = channel_id
+    try:
+        query = {}
+        if guild_id:
+            query["guild_id"] = guild_id
+        if channel_id:
+            query["channel_id"] = channel_id
 
-    conversations = await db.conversations.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
-    
-    for conv in conversations:
-        conv["_id"] = str(conv["_id"])
-    
-    return conversations
+        conversations = await Database.db.conversations.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
+        
+        for conv in conversations:
+            conv["_id"] = str(conv["_id"])
+        
+        return conversations
+    except Exception as e:
+        logger.error(f"Error listing conversations: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list conversations")
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    try:
+        await Database.db.admin.command('ping')
+        return {"status": "healthy"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Service unhealthy")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+        workers=4,
+        log_level="info",
+        timeout_keep_alive=65
+)
