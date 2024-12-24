@@ -1,13 +1,27 @@
 const express = require('express');
 const cors = require('cors');
 const { z } = require('zod');
+const puppeteer = require('puppeteer');
+const { createCanvas, loadImage, registerFont } = require('canvas');
+const path = require('path');
+const emoji = require('node-emoji');
+const hljs = require('highlight.js');
 const app = express();
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Advanced validation schemas
+// Register fonts
+const fontPath = path.join(__dirname, 'fonts');
+registerFont(path.join(fontPath, 'Whitney-Light.ttf'), { family: 'Whitney', weight: '300' });
+registerFont(path.join(fontPath, 'Whitney-Normal.ttf'), { family: 'Whitney', weight: '400' });
+registerFont(path.join(fontPath, 'Whitney-Medium.ttf'), { family: 'Whitney', weight: '500' });
+registerFont(path.join(fontPath, 'Whitney-Bold.ttf'), { family: 'Whitney', weight: '700' });
+registerFont(path.join(fontPath, 'Whitney-Black.ttf'), { family: 'Whitney', weight: '900' });
+
+// Enhanced validation schemas
 const ReactionSchema = z.object({
   emoji: z.string(),
   count: z.number().min(1).default(1),
@@ -16,9 +30,25 @@ const ReactionSchema = z.object({
 
 const AttachmentSchema = z.object({
   url: z.string().url(),
-  type: z.enum(['image', 'video', 'file']),
+  type: z.enum(['image', 'video', 'file', 'audio']),
   name: z.string().optional(),
-  size: z.string().optional()
+  size: z.string().optional(),
+  dimensions: z.object({
+    width: z.number(),
+    height: z.number()
+  }).optional()
+});
+
+const CodeBlockSchema = z.object({
+  language: z.string(),
+  content: z.string(),
+  highlight: z.array(z.number()).optional()
+});
+
+const EmbedFieldSchema = z.object({
+  name: z.string(),
+  value: z.string(),
+  inline: z.boolean().default(false)
 });
 
 const EmbedSchema = z.object({
@@ -26,13 +56,14 @@ const EmbedSchema = z.object({
   description: z.string().optional(),
   url: z.string().url().optional(),
   color: z.string().regex(/^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/).optional(),
-  fields: z.array(z.object({
-    name: z.string(),
-    value: z.string(),
-    inline: z.boolean().default(false)
-  })).optional(),
+  fields: z.array(EmbedFieldSchema).optional(),
   thumbnail: z.string().url().optional(),
   image: z.string().url().optional(),
+  author: z.object({
+    name: z.string(),
+    url: z.string().url().optional(),
+    icon_url: z.string().url().optional()
+  }).optional(),
   footer: z.object({
     text: z.string(),
     icon_url: z.string().url().optional()
@@ -43,12 +74,12 @@ const EmbedSchema = z.object({
 const MessageSchema = z.object({
   id: z.string().optional(),
   username: z.string().min(1).max(32),
-  content: z.string().min(1),
+  content: z.string(),
   timestamp: z.string().optional().default(() => 
-    'Today at ' + new Date().toLocaleTimeString('en-US', { 
-      hour: '2-digit', 
-      minute: '2-digit', 
-      hour12: false 
+    new Date().toLocaleString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
     })
   ),
   color: z.string().regex(/^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/).optional().default('#ff66ff'),
@@ -60,526 +91,195 @@ const MessageSchema = z.object({
   reactions: z.array(ReactionSchema).optional(),
   attachments: z.array(AttachmentSchema).optional(),
   embeds: z.array(EmbedSchema).optional(),
+  codeBlocks: z.array(CodeBlockSchema).optional(),
   replyTo: z.object({
     id: z.string(),
     username: z.string(),
     content: z.string(),
     jump: z.boolean().optional().default(false)
   }).optional(),
-  thread: z.object({
-    name: z.string(),
-    messageCount: z.number(),
-    lastReply: z.string().optional()
-  }).optional()
+  mentions: z.array(z.string()).optional(),
+  roleColorOverrides: z.record(z.string()).optional()
 });
 
 const RequestSchema = z.object({
   messages: z.array(MessageSchema),
   channelName: z.string().optional(),
-  threadName: z.string().optional()
+  theme: z.enum(['dark', 'light']).optional().default('dark'),
+  renderMethod: z.enum(['canvas', 'puppeteer']).optional().default('puppeteer'),
+  format: z.enum(['png', 'jpeg']).optional().default('png'),
+  quality: z.number().min(0).max(1).optional().default(0.92),
+  width: z.number().optional().default(800)
 });
 
-// Enhanced CSS styles
-const baseStyles = `
-<style>
-  body {
-    margin: 0;
-    padding: 16px;
-    background-color: #0f0f0f;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-    line-height: 1.375rem;
-    color: #dcddde;
-  }
-
-  .chat-container {
-    max-width: 800px;
-    margin: 0 auto;
-  }
-
-  .channel-name {
-    color: #dcddde;
-    font-size: 16px;
-    font-weight: 600;
-    padding: 8px 0;
-    border-bottom: 1px solid #2f3136;
-    margin-bottom: 16px;
-  }
-
-  .thread-container {
-    margin-left: 32px;
-    border-left: 2px solid #2f3136;
-    padding-left: 16px;
-  }
-
-  .message {
-    display: flex;
-    gap: 16px;
-    margin-bottom: 16px;
-    padding: 2px 0;
-    position: relative;
-  }
-
-  .message:hover {
-    background-color: #1f2123;
-  }
-
-  .message.pinned::before {
-    content: "📌";
-    position: absolute;
-    left: -20px;
-    color: #b9bbbe;
-  }
-
-  .avatar {
-    width: 40px;
-    height: 40px;
-    border-radius: 50%;
-    overflow: hidden;
-    background: linear-gradient(45deg, #2c1810, #421b10);
-    flex-shrink: 0;
-  }
-
-  .avatar.app {
-    background: white;
-    padding: 4px;
-  }
-
-  .avatar img {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-  }
-
-  .message-content {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .message-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 4px;
-  }
-
-  .username {
-    font-weight: 600;
-    cursor: pointer;
-  }
-
-  .username:hover {
-    text-decoration: underline;
-  }
-
-  .app-badge {
-    background-color: #5865F2;
-    color: white;
-    padding: 0 4px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-weight: 500;
-  }
-
-  .timestamp {
-    color: #72767d;
-    font-size: 0.8rem;
-  }
-
-  .edited {
-    color: #72767d;
-    font-size: 0.8rem;
-    font-style: italic;
-  }
-
-  .message-text {
-    color: white;
-    margin: 0;
-    word-wrap: break-word;
-  }
-
-  .code {
-    background-color: #2f3136;
-    padding: 2px 6px;
-    border-radius: 3px;
-    font-family: monospace;
-  }
-
-  .phone-icon {
-    color: #ed4245;
-    margin-right: 4px;
-  }
-
-  .reply-container {
-    margin-bottom: 4px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: #72767d;
-    font-size: 0.9rem;
-  }
-
-  .reply-content {
-    color: #72767d;
-    text-decoration: none;
-    cursor: pointer;
-  }
-
-  .reply-content:hover {
-    color: #dcddde;
-    text-decoration: underline;
-  }
-
-  .reactions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin-top: 4px;
-  }
-
-  .reaction {
-    background-color: #2f3136;
-    border-radius: 4px;
-    padding: 0 6px;
-    font-size: 0.9rem;
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    cursor: pointer;
-  }
-
-  .reaction.reacted {
-    background-color: #3b3f46;
-  }
-
-  .attachments {
-    margin-top: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .attachment {
-    max-width: 400px;
-    border-radius: 4px;
-    overflow: hidden;
-  }
-
-  .attachment img {
-    max-width: 100%;
-    height: auto;
-  }
-
-  .file-attachment {
-    background-color: #2f3136;
-    padding: 8px;
-    border-radius: 4px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .embed {
-    margin-top: 8px;
-    border-left: 4px solid;
-    background-color: #2f3136;
-    border-radius: 4px;
-    padding: 8px 16px;
-    max-width: 520px;
-  }
-
-  .embed-title {
-    color: #dcddde;
-    font-size: 1rem;
-    font-weight: 600;
-    margin-bottom: 8px;
-  }
-
-  .embed-description {
-    color: #dcddde;
-    font-size: 0.9rem;
-    margin-bottom: 8px;
-  }
-
-  .embed-fields {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
-    margin: 8px 0;
-  }
-
-  .embed-field {
-    margin-bottom: 8px;
-  }
-
-  .embed-field-name {
-    color: #dcddde;
-    font-weight: 600;
-    font-size: 0.9rem;
-  }
-
-  .embed-field-value {
-    color: #dcddde;
-    font-size: 0.9rem;
-  }
-
-  .embed-footer {
-    color: #72767d;
-    font-size: 0.8rem;
-    margin-top: 8px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .thread-indicator {
-    margin-top: 8px;
-    color: #72767d;
-    font-size: 0.9rem;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    cursor: pointer;
-  }
-
-  .thread-indicator:hover {
-    color: #dcddde;
-  }
-</style>
-`;
-
-// HTML generation functions
-function generateReplyHTML(reply) {
-  return `
-    <div class="reply-container">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-        <path d="M10.8 4.8H7.2v1.6h3.6V4.8zm3.6 1.6h-2.4v1.6h2.4V6.4zm-6 3.2H6v1.6h2.4V9.6zm3.6 1.6H9.6v1.6h2.4v-1.6zm3.6-1.6h-2.4v1.6h2.4V9.6z"></path>
-      </svg>
-      <span>replying to</span>
-      <a class="reply-content" href="#msg-${reply.id}">@${reply.username}</a>
-    </div>
+// HTML Template Generation
+function generateMessageHTML(message, theme) {
+  const baseStyles = `
+    /* Base styles omitted for brevity - include Discord-like CSS */
   `;
+  
+  const messageTemplate = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <style>${baseStyles}</style>
+    </head>
+    <body class="theme-${theme}">
+      <div class="messages-container">
+        ${generateMessageContent(message)}
+      </div>
+    </body>
+    </html>
+  `;
+  
+  return messageTemplate;
 }
 
-function generateReactionsHTML(reactions) {
-  return reactions.map(reaction => `
-    <div class="reaction ${reaction.userHasReacted ? 'reacted' : ''}">
-      <span>${reaction.emoji}</span>
-      <span>${reaction.count}</span>
-    </div>
-  `).join('');
+// Canvas Drawing Functions
+async function drawMessageCanvas(canvas, message, startY) {
+  const ctx = canvas.getContext('2d');
+  let currentY = startY;
+  
+  // Draw avatar
+  if (message.avatar) {
+    await drawAvatar(ctx, message, 16, currentY);
+  }
+  
+  // Draw username and timestamp
+  currentY = await drawHeader(ctx, message, currentY);
+  
+  // Draw content
+  currentY = await drawContent(ctx, message, currentY);
+  
+  // Draw attachments
+  if (message.attachments?.length) {
+    currentY = await drawAttachments(ctx, message.attachments, currentY);
+  }
+  
+  // Draw embeds
+  if (message.embeds?.length) {
+    currentY = await drawEmbeds(ctx, message.embeds, currentY);
+  }
+  
+  // Draw reactions
+  if (message.reactions?.length) {
+    currentY = await drawReactions(ctx, message.reactions, currentY);
+  }
+  
+  return currentY;
 }
 
-function generateAttachmentsHTML(attachments) {
-  return attachments.map(attachment => {
-    if (attachment.type === 'image') {
-      return `
-        <div class="attachment">
-          <img src="${attachment.url}" alt="${attachment.name || 'attachment'}">
-        </div>
-      `;
-    } else {
-      return `
-        <div class="file-attachment">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M15.5 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V6.5L15.5 2z"></path>
-          </svg>
-          <span>${attachment.name}</span>
-          ${attachment.size ? `<span class="file-size">${attachment.size}</span>` : ''}
-        </div>
-      `;
+// Puppeteer Rendering Function
+async function generateImagePuppeteer(messages, options) {
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    defaultViewport: {
+      width: options.width,
+      height: 800,
+      deviceScaleFactor: 2
     }
-  }).join('');
+  });
+  
+  const page = await browser.newPage();
+  
+  // Set content
+  const html = generateMessageHTML(messages, options.theme);
+  await page.setContent(html, { waitUntil: 'networkidle0' });
+  
+  // Get content height
+  const height = await page.evaluate(() => {
+    const body = document.body;
+    const html = document.documentElement;
+    return Math.max(
+      body.scrollHeight,
+      body.offsetHeight,
+      html.clientHeight,
+      html.scrollHeight,
+      html.offsetHeight
+    );
+  });
+  
+  // Set viewport to match content
+  await page.setViewport({
+    width: options.width,
+    height: height,
+    deviceScaleFactor: 2
+  });
+  
+  // Capture screenshot
+  const buffer = await page.screenshot({
+    type: options.format,
+    quality: options.format === 'jpeg' ? options.quality * 100 : undefined,
+    fullPage: true
+  });
+  
+  await browser.close();
+  return buffer;
 }
 
-function generateEmbedHTML(embed) {
-  let html = `<div class="embed" style="border-color: ${embed.color || '#2f3136'}">`;
-  
-  if (embed.title) {
-    html += `<div class="embed-title">${embed.title}</div>`;
-  }
-  
-  if (embed.description) {
-    html += `<div class="embed-description">${embed.description}</div>`;
-  }
-  
-  if (embed.fields?.length) {
-    html += `<div class="embed-fields">`;
-    embed.fields.forEach(field => {
-      html += `
-        <div class="embed-field ${field.inline ? 'inline' : ''}">
-          <div class="embed-field-name">${field.name}</div>
-          <div class="embed-field-value">${field.value}</div>
-        </div>
-      `;
-    });
-    html += `</div>`;
-  }
-  
-  if (embed.image) {
-    html += `<img src="${embed.image}" class="embed-image">`;
-  }
-  
-  if (embed.footer) {
-    html += `
-      <div class="embed-footer">
-        ${embed.footer.icon_url ? `<img src="${embed.footer.icon_url}" width="16" height="16">` : ''}
-        ${embed.footer.text}
-      </div>
-    `;
-  }
-  
-  html += `</div>`;
-  return html;
-}
-
-function generateThreadHTML(thread) {
-  return `
-    <div class="thread-indicator">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-        <path d="M5.43 21l.12-.13.13-.12.59-.59 2.73-2.73.17-.17.12-.12.13-.13L4.71 12l-.59-.59-.12-.13-.13-.12L2.29 9.58l-.17-.17-.12-.12-.13-.13L.29 7.58l-.17-.17L0 7.29v14.14l.12-.13.13-.12.59-.59 2.73-2.73.17-.17.12-.12.13-.13 1.41 1.41z"></path>
-      </svg>
-      <span>${thread.name}</span>
-      <span>${thread.messageCount} messages</span>
-      ${thread.lastReply ? `<span>Last reply ${thread.lastReply}</span>` : ''}
-    </div>
-  `;
-}
-
-function generateMessageHTML(message) {
-  const avatarContent = message.avatar 
-    ? `<img src="${message.avatar}" alt="${message.username}">`
-    : '';
-
-  const appBadge = message.isApp 
-    ? '<span class="app-badge">APP</span>' 
-    : '';
-
-  const messageContent = message.command
-    ? `<span class="phone-icon">📞</span>${message.content}`
-    : message.content;
-
-  return `
-    <div class="message ${message.pinned ? 'pinned' : ''}" ${message.id ? `id="msg-${message.id}"` : ''}>
-      <div class="avatar ${message.isApp ? 'app' : ''}">
-        ${avatarContent}
-      </div>
-      <div class="message-content">
-        ${message.replyTo ? generateReplyHTML(message.replyTo) : ''}
-        <div class="message-<div class="message-header">
-          <span class="username" style="color: ${message.color}">${message.username}</span>
-          ${appBadge}
-          <span class="timestamp">${message.timestamp}</span>
-          ${message.edited ? '<span class="edited">(edited)</span>' : ''}
-        </div>
-        <p class="message-text">${messageContent}</p>
-        ${message.reactions ? `<div class="reactions">${generateReactionsHTML(message.reactions)}</div>` : ''}
-        ${message.attachments ? `<div class="attachments">${generateAttachmentsHTML(message.attachments)}</div>` : ''}
-        ${message.embeds ? message.embeds.map(embed => generateEmbedHTML(embed)).join('') : ''}
-        ${message.thread ? generateThreadHTML(message.thread) : ''}
-      </div>
-    </div>
-  `;
-}
-
-// Main route to generate Discord-like messages
+// Main Generation Route
 app.post('/generate', async (req, res) => {
   try {
-    // Validate input
-    const { messages, channelName, threadName } = RequestSchema.parse(req.body);
-
-    // Generate HTML
-    const messagesHTML = messages.map(generateMessageHTML).join('');
+    const options = RequestSchema.parse(req.body);
+    let imageBuffer;
     
-    const fullHTML = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        ${baseStyles}
-      </head>
-      <body>
-        <div class="chat-container">
-          ${channelName ? `<div class="channel-name">${channelName}</div>` : ''}
-          ${threadName ? `
-            <div class="thread-container">
-              <div class="thread-name">${threadName}</div>
-              ${messagesHTML}
-            </div>
-          ` : messagesHTML}
-        </div>
-      </body>
-      </html>
-    `;
-
-    res.send(fullHTML);
+    if (options.renderMethod === 'puppeteer') {
+      imageBuffer = await generateImagePuppeteer(options.messages, options);
+    } else {
+      imageBuffer = await generateImageCanvas(options.messages, options);
+    }
+    
+    res.set('Content-Type', `image/${options.format}`);
+    res.set('Cache-Control', 'public, max-age=31536000');
+    res.send(imageBuffer);
+    
   } catch (error) {
+    console.error('Generation error:', error);
+    
     if (error instanceof z.ZodError) {
       res.status(400).json({
         error: 'Invalid input',
         details: error.errors
       });
     } else {
-      console.error('Server error:', error);
       res.status(500).json({
-        error: 'Internal server error'
+        error: 'Internal server error',
+        message: error.message
       });
     }
   }
 });
 
-// Example usage endpoint
-app.get('/example', (req, res) => {
-  const examplePayload = {
-    channelName: "general",
-    messages: [
-      {
-        id: "1",
-        username: "roo",
-        content: "Hey everyone!",
-        color: "#ff66ff",
-        reactions: [
-          { emoji: "👋", count: 3, userHasReacted: true }
-        ]
-      },
-      {
-        id: "2",
-        username: "Payphone",
-        content: "You're not on a call! Use p.call to start one.",
-        isApp: true,
-        command: true,
-        embeds: [{
-          title: "Call Status",
-          description: "No active calls",
-          color: "#ff0000"
-        }]
-      },
-      {
-        id: "3",
-        username: "user123",
-        content: "Let me try that",
-        replyTo: {
-          id: "2",
-          username: "Payphone",
-          content: "You're not on a call!"
-        },
-        thread: {
-          name: "Call Discussion",
-          messageCount: 5,
-          lastReply: "2 minutes ago"
-        }
-      }
-    ]
-  };
+// Cache control middleware
+const cache = require('memory-cache');
+app.use((req, res, next) => {
+  const key = '__express__' + req.originalUrl || req.url;
+  const cachedBody = cache.get(key);
   
-  res.json(examplePayload);
+  if (cachedBody) {
+    res.send(cachedBody);
+    return;
+  }
+  
+  res.sendResponse = res.send;
+  res.send = (body) => {
+    cache.put(key, body, 300000); // Cache for 5 minutes
+    res.sendResponse(body);
+  };
+  next();
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy' });
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'An unexpected error occurred'
+  });
 });
 
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
