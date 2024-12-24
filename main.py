@@ -18,7 +18,7 @@ app.add_middleware(
 )
 
 # MongoDB Setup
-MONGODB_URL = "mongodb://localhost:27017"
+MONGODB_URL = "mongodb+srv://flyhigh:Shekhar9330@cluster0.0dqoh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 client = AsyncIOMotorClient(MONGODB_URL)
 db = client.discord_archives
 
