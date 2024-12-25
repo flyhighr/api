@@ -323,12 +323,16 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+    
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=False,
         workers=4,
         log_level="info",
         timeout_keep_alive=65
     )
+
