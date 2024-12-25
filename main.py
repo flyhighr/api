@@ -15,15 +15,21 @@ import time
 from functools import wraps
 import os
 
-# Configure logging
+# Configure logging with rotating file handler
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
+        RotatingFileHandler(
+            'app.log',
+            maxBytes=1024*1024,  # 1MB
+            backupCount=5
+        ),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
+
 # Enhanced Models with modern Pydantic configuration
 class BaseModelWithConfig(BaseModel):
     model_config = ConfigDict(
@@ -77,7 +83,7 @@ class Conversation(BaseModelWithConfig):
 class Database:
     client: Optional[AsyncIOMotorClient] = None
     db = None
-    MONGO_URI = "mongodb+srv://flyhigh:Shekhar9330@cluster0.0dqoh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+    MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://flyhigh:Shekhar9330@cluster0.0dqoh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
     MAX_RETRIES = 3
     RETRY_DELAY = 5
 
@@ -93,6 +99,7 @@ class Database:
                     connectTimeoutMS=10000
                 )
                 cls.db = cls.client.discord_archives
+                # Fixed: Use client.admin.command instead of db.admin.command
                 await cls.client.admin.command('ping')
                 logger.info("Successfully connected to MongoDB")
                 return
@@ -111,7 +118,6 @@ class Database:
             cls.client.close()
             logger.info("MongoDB connection closed")
 
-
 class SelfPingService:
     def __init__(self, url: str = "https://api-v9ww.onrender.com/health", interval: int = 840):
         self.url = url
@@ -119,10 +125,17 @@ class SelfPingService:
         self.session: Optional[aiohttp.ClientSession] = None
         self.is_running = False
         self.last_ping_time = 0
+        self._task: Optional[asyncio.Task] = None
 
     async def start(self):
+        if self._task is not None:
+            return
+
         self.is_running = True
         self.session = aiohttp.ClientSession()
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self):
         while self.is_running:
             try:
                 current_time = time.time()
@@ -139,16 +152,24 @@ class SelfPingService:
 
     async def stop(self):
         self.is_running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        
         if self.session:
             await self.session.close()
 
-# FastAPI app initialization
+# FastAPI app initialization with lifespan
 app = FastAPI(
     title="Discord Archive API",
     description="API for managing Discord conversation archives",
-    version="1.1.0"
+    version="1.1.0",
+    lifespan=lifespan
 )
-
 
 # Performance monitoring decorator
 def monitor_performance():
@@ -173,7 +194,7 @@ async def lifespan(app: FastAPI):
     
     # Startup
     await Database.connect_db()
-    asyncio.create_task(ping_service.start())
+    await ping_service.start()
     
     # Handle shutdown signals
     def signal_handler(sig, frame):
@@ -189,13 +210,12 @@ async def lifespan(app: FastAPI):
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    yield
-    
-    # Cleanup
-    await ping_service.stop()
-    await Database.close_db()
-
-
+    try:
+        yield
+    finally:
+        # Cleanup
+        await ping_service.stop()
+        await Database.close_db()
 
 # CORS Setup
 app.add_middleware(
@@ -206,19 +226,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.on_event("startup")
-async def startup_event():
-    await Database.connect_db()
-    # Start the self-ping service
-    ping_service = SelfPingService()
-    asyncio.create_task(ping_service.start())
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await Database.close_db()
-
-# Enhanced error handling middleware with detailed logging
+# Enhanced error handling middleware
 @app.middleware("http")
 async def error_handling_middleware(request, call_next):
     try:
@@ -229,7 +237,7 @@ async def error_handling_middleware(request, call_next):
         return response
     except Exception as e:
         logger.error(f"Unhandled error: {str(e)}", exc_info=True)
-        return HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # Enhanced routes with performance monitoring
 @app.post("/conversations/")
@@ -272,7 +280,7 @@ async def get_share_url(conversation_id: str):
             logger.warning(f"Conversation not found: {conversation_id}")
             raise HTTPException(status_code=404, detail="Conversation not found")
         
-        base_url = "https://flyhighr.github.io/archive/"
+        base_url = os.getenv("BASE_URL", "https://flyhighr.github.io/archive/")
         share_url = f"{base_url}?id={conversation_id}"
         
         await Database.db.conversations.update_one(
@@ -323,7 +331,8 @@ async def list_conversations(
 @monitor_performance()
 async def health_check():
     try:
-        await Database.db.admin.command('ping')
+        # Fixed: Use client.admin.command instead of db.admin.command
+        await Database.client.admin.command('ping')
         return {
             "status": "healthy",
             "timestamp": datetime.utcnow(),
@@ -333,13 +342,15 @@ async def health_check():
         logger.error(f"Health check failed: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Service unhealthy")
 
+# Environment variables
 PORT = int(os.getenv("PORT", 10000))
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        app,
+        "main:app",
         host="0.0.0.0",
         port=PORT,
-        workers=1  # Reduced worker count for stability
+        workers=1,
+        log_level="info"
     )
