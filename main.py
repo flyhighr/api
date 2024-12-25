@@ -98,13 +98,15 @@ class Database:
     client: Optional[AsyncIOMotorClient] = None
     db = None
     _retry_attempts = 3
-    _retry_delay = 1  # seconds
+    _retry_delay = 1
 
     @classmethod
     async def connect_db(cls):
+        if cls.client:  # Return if already connected
+            return
+            
         for attempt in range(cls._retry_attempts):
             try:
-                logger.info(f"Connecting to MongoDB (attempt {attempt + 1}/{cls._retry_attempts})...")
                 cls.client = AsyncIOMotorClient(
                     Config.MONGODB_URI,
                     serverSelectionTimeoutMS=Config.MONGODB_TIMEOUT,
@@ -112,22 +114,25 @@ class Database:
                     maxPoolSize=50
                 )
                 cls.db = cls.client.discord_archives
+                # Test connection
                 await cls.client.admin.command('ping')
                 logger.info("Successfully connected to MongoDB")
                 return
             except Exception as e:
+                logger.error(f"MongoDB connection attempt {attempt + 1} failed: {e}")
+                if cls.client:
+                    cls.client.close()
+                    cls.client = None
                 if attempt == cls._retry_attempts - 1:
-                    logger.error(f"Failed to connect to MongoDB after {cls._retry_attempts} attempts: {e}")
                     raise
-                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
                 await asyncio.sleep(cls._retry_delay)
 
     @classmethod
-    async def close_db(cls):
-        if cls.client:
-            logger.info("Closing MongoDB connection...")
-            cls.client.close()
-            logger.info("MongoDB connection closed")
+    async def get_db(cls):
+        if not cls.client:
+            await cls.connect_db()
+        return cls.db
+
 
 # Self-ping service
 class PingService:
@@ -325,14 +330,19 @@ if __name__ == "__main__":
     import uvicorn
     import os
     
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.getenv("PORT", "10000"))
+    
+    # Configure logging before starting server
+    logging.basicConfig(level=logging.INFO)
+    
+    # Explicitly bind to all interfaces
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=port,
         reload=False,
         workers=4,
         log_level="info",
-        timeout_keep_alive=65
+        timeout_keep_alive=65,
+        log_config=None
     )
-
