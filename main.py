@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -11,9 +12,8 @@ import signal
 import sys
 from logging.handlers import RotatingFileHandler
 import aiohttp
-import json
-from functools import wraps
 import time
+import os
 
 # Enhanced logging configuration
 logging.basicConfig(
@@ -30,11 +30,12 @@ logger = logging.getLogger(__name__)
 class Config:
     MONGODB_URI = "mongodb+srv://flyhigh:Shekhar9330@cluster0.0dqoh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
     API_URL = "https://api-v9ww.onrender.com"
-    PING_INTERVAL = 840  # 14 minutes in seconds
+    PING_INTERVAL = 840
     MONGODB_TIMEOUT = 5000
     MONGODB_CONNECT_TIMEOUT = 10000
+    PORT = int(os.getenv("PORT", "10000"))
 
-# Enhanced Models with validation
+# Data Models
 class ReactionUser(BaseModel):
     id: str
     name: str
@@ -82,18 +83,7 @@ class Conversation(BaseModel):
     channel_id: str
     model_config = ConfigDict(frozen=True)
 
-# Performance monitoring decorator
-def measure_performance(func):
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = await func(*args, **kwargs)
-        execution_time = time.time() - start_time
-        logger.info(f"{func.__name__} executed in {execution_time:.2f} seconds")
-        return result
-    return wrapper
-
-# Enhanced Database class with connection pooling and retry logic
+# Database Management
 class Database:
     client: Optional[AsyncIOMotorClient] = None
     db = None
@@ -102,11 +92,12 @@ class Database:
 
     @classmethod
     async def connect_db(cls):
-        if cls.client:  # Return if already connected
+        if cls.client:
             return
-            
+
         for attempt in range(cls._retry_attempts):
             try:
+                logger.info(f"Connecting to MongoDB (attempt {attempt + 1}/{cls._retry_attempts})...")
                 cls.client = AsyncIOMotorClient(
                     Config.MONGODB_URI,
                     serverSelectionTimeoutMS=Config.MONGODB_TIMEOUT,
@@ -114,7 +105,6 @@ class Database:
                     maxPoolSize=50
                 )
                 cls.db = cls.client.discord_archives
-                # Test connection
                 await cls.client.admin.command('ping')
                 logger.info("Successfully connected to MongoDB")
                 return
@@ -128,13 +118,34 @@ class Database:
                 await asyncio.sleep(cls._retry_delay)
 
     @classmethod
+    async def close_db(cls):
+        if cls.client:
+            cls.client.close()
+            cls.client = None
+            logger.info("MongoDB connection closed")
+
+    @classmethod
     async def get_db(cls):
         if not cls.client:
             await cls.connect_db()
         return cls.db
 
+# Performance Monitoring
+def measure_performance(func):
+    async def wrapper(*args, **kwargs):
+        start_time = time.time()
+        try:
+            result = await func(*args, **kwargs)
+            execution_time = time.time() - start_time
+            logger.info(f"{func.__name__} executed in {execution_time:.2f} seconds")
+            return result
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"{func.__name__} failed after {execution_time:.2f} seconds: {str(e)}")
+            raise
+    return wrapper
 
-# Self-ping service
+# Health Check Service
 class PingService:
     def __init__(self, url: str, interval: int):
         self.url = url
@@ -170,7 +181,7 @@ class PingService:
                 logger.error(f"Error during self-ping: {e}")
             await asyncio.sleep(self.interval)
 
-# Enhanced application lifecycle management
+# Application Lifecycle Management
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ping_service = PingService(Config.API_URL, Config.PING_INTERVAL)
@@ -179,27 +190,13 @@ async def lifespan(app: FastAPI):
     await Database.connect_db()
     await ping_service.start()
     
-    # Enhanced shutdown handler
-    async def shutdown():
-        logger.info("Initiating graceful shutdown...")
-        await ping_service.stop()
-        await Database.close_db()
-        sys.exit(0)
-
-    def signal_handler(sig, frame):
-        logger.info(f"Received signal {sig}")
-        asyncio.create_task(shutdown())
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
     yield
     
-    # Cleanup
+    # Shutdown
     await ping_service.stop()
     await Database.close_db()
 
-# FastAPI app initialization with enhanced middleware
+# FastAPI Application
 app = FastAPI(
     title="Discord Archive API",
     description="API for archiving and retrieving Discord conversations",
@@ -207,7 +204,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS Setup
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -216,9 +213,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enhanced error handling middleware with request tracking
+# Request Tracking Middleware
 @app.middleware("http")
-async def error_handling_middleware(request: Request, call_next):
+async def request_tracking_middleware(request: Request, call_next):
     request_id = f"{time.time()}-{id(request)}"
     logger.info(f"Request {request_id}: {request.method} {request.url}")
     try:
@@ -229,15 +226,16 @@ async def error_handling_middleware(request: Request, call_next):
         return response
     except Exception as e:
         logger.error(f"Request {request_id} failed: {str(e)}")
-        return HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-# Enhanced routes with performance monitoring
+# API Routes
 @app.post("/conversations/")
 @measure_performance
 async def create_conversation(conversation: Conversation):
     try:
+        db = await Database.get_db()
         conversation_dict = conversation.model_dump()
-        result = await Database.db.conversations.insert_one(conversation_dict)
+        await db.conversations.insert_one(conversation_dict)
         logger.info(f"Created conversation: {conversation.conversation_id}")
         return {"conversation_id": conversation.conversation_id, "status": "success"}
     except Exception as e:
@@ -248,45 +246,17 @@ async def create_conversation(conversation: Conversation):
 @measure_performance
 async def get_conversation(conversation_id: str):
     try:
-        conversation = await Database.db.conversations.find_one({"conversation_id": conversation_id})
+        db = await Database.get_db()
+        conversation = await db.conversations.find_one({"conversation_id": conversation_id})
         if not conversation:
-            logger.warning(f"Conversation not found: {conversation_id}")
             raise HTTPException(status_code=404, detail="Conversation not found")
-        
         conversation["_id"] = str(conversation["_id"])
-        conversation["messages"].sort(key=lambda x: x["timestamp"])
-        
         return conversation
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error retrieving conversation {conversation_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve conversation")
-
-@app.get("/conversations/{conversation_id}/share-url")
-@measure_performance
-async def get_share_url(conversation_id: str):
-    try:
-        conversation = await Database.db.conversations.find_one({"conversation_id": conversation_id})
-        if not conversation:
-            logger.warning(f"Conversation not found: {conversation_id}")
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        
-        base_url = "https://flyhighr.github.io/archive/"
-        share_url = f"{base_url}?id={conversation_id}"
-        
-        await Database.db.conversations.update_one(
-            {"conversation_id": conversation_id},
-            {"$set": {"share_url": share_url}}
-        )
-        
-        logger.info(f"Generated share URL for conversation: {conversation_id}")
-        return {"share_url": share_url}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error generating share URL for conversation {conversation_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate share URL")
 
 @app.get("/conversations")
 @measure_performance
@@ -297,13 +267,14 @@ async def list_conversations(
     skip: int = 0
 ):
     try:
+        db = await Database.get_db()
         query = {}
         if guild_id:
             query["guild_id"] = guild_id
         if channel_id:
             query["channel_id"] = channel_id
 
-        conversations = await Database.db.conversations.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
+        conversations = await db.conversations.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
         
         for conv in conversations:
             conv["_id"] = str(conv["_id"])
@@ -316,7 +287,8 @@ async def list_conversations(
 @app.get("/health")
 async def health_check():
     try:
-        await Database.db.admin.command('ping')
+        db = await Database.get_db()
+        await db.admin.command('ping')
         return {
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
@@ -326,23 +298,14 @@ async def health_check():
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=503, detail="Service unhealthy")
 
+# Application Entry Point
 if __name__ == "__main__":
     import uvicorn
-    import os
     
-    port = int(os.getenv("PORT", "10000"))
-    
-    # Configure logging before starting server
-    logging.basicConfig(level=logging.INFO)
-    
-    # Explicitly bind to all interfaces
     uvicorn.run(
-        app,
+        "main:app",
         host="0.0.0.0",
-        port=port,
-        reload=False,
+        port=Config.PORT,
         workers=4,
-        log_level="info",
-        timeout_keep_alive=65,
-        log_config=None
+        log_level="info"
     )
