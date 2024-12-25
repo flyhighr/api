@@ -1,9 +1,8 @@
-# main.py
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 from datetime import datetime
 import logging
 import asyncio
@@ -13,9 +12,9 @@ import sys
 from logging.handlers import RotatingFileHandler
 import aiohttp
 import time
-import os
+from functools import wraps
 
-# Enhanced logging configuration
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -26,42 +25,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-class Config:
-    MONGODB_URI = "mongodb+srv://flyhigh:Shekhar9330@cluster0.0dqoh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
-    API_URL = "https://api-v9ww.onrender.com"
-    PING_INTERVAL = 840
-    MONGODB_TIMEOUT = 5000
-    MONGODB_CONNECT_TIMEOUT = 10000
-    PORT = int(os.getenv("PORT", "10000"))
+# Enhanced Models with modern Pydantic configuration
+class BaseModelWithConfig(BaseModel):
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        populate_by_name=True,
+        from_attributes=True
+    )
 
-# Data Models
-class ReactionUser(BaseModel):
+class ReactionUser(BaseModelWithConfig):
     id: str
     name: str
     avatar_url: str
-    model_config = ConfigDict(frozen=True)
 
-class Reaction(BaseModel):
+class Reaction(BaseModelWithConfig):
     emoji: str
     count: int
     users: List[ReactionUser]
-    model_config = ConfigDict(frozen=True)
 
-class Attachment(BaseModel):
+class Attachment(BaseModelWithConfig):
     url: str
     filename: str
     content_type: str
     size: int
-    model_config = ConfigDict(frozen=True)
 
-class ReplyReference(BaseModel):
+class ReplyReference(BaseModelWithConfig):
     message_id: str
     author: str
     content: str
-    model_config = ConfigDict(frozen=True)
 
-class Message(BaseModel):
+class Message(BaseModelWithConfig):
     content: str
     author: str
     author_nickname: Optional[str] = None
@@ -72,139 +65,138 @@ class Message(BaseModel):
     reply_to: Optional[ReplyReference] = None
     reactions: List[Reaction] = Field(default_factory=list)
     attachments: List[Attachment] = Field(default_factory=list)
-    model_config = ConfigDict(frozen=True)
 
-class Conversation(BaseModel):
+class Conversation(BaseModelWithConfig):
     conversation_id: str
     messages: List[Message]
     share_url: Optional[str] = None
     created_at: datetime
     guild_id: str
     channel_id: str
-    model_config = ConfigDict(frozen=True)
 
-# Database Management
+# Database connection management with retry mechanism
 class Database:
     client: Optional[AsyncIOMotorClient] = None
     db = None
-    _retry_attempts = 3
-    _retry_delay = 1
+    MONGO_URI = "mongodb+srv://flyhigh:Shekhar9330@cluster0.0dqoh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+    MAX_RETRIES = 3
+    RETRY_DELAY = 5
 
     @classmethod
     async def connect_db(cls):
-        if cls.client:
-            return
-
-        for attempt in range(cls._retry_attempts):
+        retries = 0
+        while retries < cls.MAX_RETRIES:
             try:
-                logger.info(f"Connecting to MongoDB (attempt {attempt + 1}/{cls._retry_attempts})...")
+                logger.info(f"Connecting to MongoDB (attempt {retries + 1}/{cls.MAX_RETRIES})...")
                 cls.client = AsyncIOMotorClient(
-                    Config.MONGODB_URI,
-                    serverSelectionTimeoutMS=Config.MONGODB_TIMEOUT,
-                    connectTimeoutMS=Config.MONGODB_CONNECT_TIMEOUT,
-                    maxPoolSize=50
+                    cls.MONGO_URI,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=10000
                 )
                 cls.db = cls.client.discord_archives
                 await cls.client.admin.command('ping')
                 logger.info("Successfully connected to MongoDB")
                 return
             except Exception as e:
-                logger.error(f"MongoDB connection attempt {attempt + 1} failed: {e}")
-                if cls.client:
-                    cls.client.close()
-                    cls.client = None
-                if attempt == cls._retry_attempts - 1:
+                retries += 1
+                if retries == cls.MAX_RETRIES:
+                    logger.error(f"Failed to connect to MongoDB after {cls.MAX_RETRIES} attempts: {e}")
                     raise
-                await asyncio.sleep(cls._retry_delay)
+                logger.warning(f"Failed to connect to MongoDB (attempt {retries}): {e}")
+                await asyncio.sleep(cls.RETRY_DELAY)
 
     @classmethod
     async def close_db(cls):
         if cls.client:
+            logger.info("Closing MongoDB connection...")
             cls.client.close()
-            cls.client = None
             logger.info("MongoDB connection closed")
 
-    @classmethod
-    async def get_db(cls):
-        if not cls.client:
-            await cls.connect_db()
-        return cls.db
-
-# Performance Monitoring
-def measure_performance(func):
-    async def wrapper(*args, **kwargs):
-        start_time = time.time()
-        try:
-            result = await func(*args, **kwargs)
-            execution_time = time.time() - start_time
-            logger.info(f"{func.__name__} executed in {execution_time:.2f} seconds")
-            return result
-        except Exception as e:
-            execution_time = time.time() - start_time
-            logger.error(f"{func.__name__} failed after {execution_time:.2f} seconds: {str(e)}")
-            raise
-    return wrapper
-
-# Health Check Service
-class PingService:
-    def __init__(self, url: str, interval: int):
+# Self-ping service
+class SelfPingService:
+    def __init__(self, url: str = "https://api-v9ww.onrender.com/health", interval: int = 840):
         self.url = url
         self.interval = interval
         self.session: Optional[aiohttp.ClientSession] = None
-        self._task: Optional[asyncio.Task] = None
+        self.is_running = False
+        self.last_ping_time = 0
 
     async def start(self):
+        self.is_running = True
         self.session = aiohttp.ClientSession()
-        self._task = asyncio.create_task(self._ping_loop())
-        logger.info(f"Started ping service for {self.url}")
+        while self.is_running:
+            try:
+                current_time = time.time()
+                if current_time - self.last_ping_time >= self.interval:
+                    async with self.session.get(self.url) as response:
+                        if response.status == 200:
+                            logger.info("Self-ping successful")
+                            self.last_ping_time = current_time
+                        else:
+                            logger.warning(f"Self-ping failed with status {response.status}")
+            except Exception as e:
+                logger.error(f"Self-ping error: {e}")
+            await asyncio.sleep(60)  # Check every minute
 
     async def stop(self):
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        self.is_running = False
         if self.session:
             await self.session.close()
-        logger.info("Stopped ping service")
 
-    async def _ping_loop(self):
-        while True:
+# Performance monitoring decorator
+def monitor_performance():
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            start_time = time.time()
             try:
-                async with self.session.get(f"{self.url}/health") as response:
-                    if response.status == 200:
-                        logger.info("Self-ping successful")
-                    else:
-                        logger.warning(f"Self-ping failed with status {response.status}")
-            except Exception as e:
-                logger.error(f"Error during self-ping: {e}")
-            await asyncio.sleep(self.interval)
+                result = await func(*args, **kwargs)
+                return result
+            finally:
+                execution_time = time.time() - start_time
+                logger.info(f"{func.__name__} executed in {execution_time:.2f} seconds")
+        return wrapper
+    return decorator
 
-# Application Lifecycle Management
+# Lifecycle management
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ping_service = PingService(Config.API_URL, Config.PING_INTERVAL)
+    # Initialize services
+    ping_service = SelfPingService()
     
     # Startup
     await Database.connect_db()
-    await ping_service.start()
+    asyncio.create_task(ping_service.start())
+    
+    # Handle shutdown signals
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}")
+        asyncio.create_task(shutdown())
+
+    async def shutdown():
+        logger.info("Initiating graceful shutdown...")
+        await ping_service.stop()
+        await Database.close_db()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     yield
     
-    # Shutdown
+    # Cleanup
     await ping_service.stop()
     await Database.close_db()
 
-# FastAPI Application
+# FastAPI app initialization
 app = FastAPI(
     title="Discord Archive API",
-    description="API for archiving and retrieving Discord conversations",
+    description="API for managing Discord conversation archives",
     version="1.1.0",
     lifespan=lifespan
 )
 
-# CORS Middleware
+# CORS Setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -213,53 +205,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request Tracking Middleware
+# Enhanced error handling middleware with detailed logging
 @app.middleware("http")
-async def request_tracking_middleware(request: Request, call_next):
-    request_id = f"{time.time()}-{id(request)}"
-    logger.info(f"Request {request_id}: {request.method} {request.url}")
+async def error_handling_middleware(request, call_next):
     try:
         start_time = time.time()
         response = await call_next(request)
-        duration = time.time() - start_time
-        logger.info(f"Request {request_id} completed in {duration:.2f}s")
+        process_time = time.time() - start_time
+        response.headers["X-Process-Time"] = str(process_time)
         return response
     except Exception as e:
-        logger.error(f"Request {request_id} failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"Unhandled error: {str(e)}", exc_info=True)
+        return HTTPException(status_code=500, detail="Internal server error")
 
-# API Routes
+# Enhanced routes with performance monitoring
 @app.post("/conversations/")
-@measure_performance
+@monitor_performance()
 async def create_conversation(conversation: Conversation):
     try:
-        db = await Database.get_db()
         conversation_dict = conversation.model_dump()
-        await db.conversations.insert_one(conversation_dict)
+        result = await Database.db.conversations.insert_one(conversation_dict)
         logger.info(f"Created conversation: {conversation.conversation_id}")
-        return {"conversation_id": conversation.conversation_id, "status": "success"}
+        return {"conversation_id": conversation.conversation_id, "inserted_id": str(result.inserted_id)}
     except Exception as e:
-        logger.error(f"Error creating conversation: {e}")
+        logger.error(f"Error creating conversation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to create conversation")
 
 @app.get("/conversations/{conversation_id}")
-@measure_performance
+@monitor_performance()
 async def get_conversation(conversation_id: str):
     try:
-        db = await Database.get_db()
-        conversation = await db.conversations.find_one({"conversation_id": conversation_id})
+        conversation = await Database.db.conversations.find_one({"conversation_id": conversation_id})
         if not conversation:
+            logger.warning(f"Conversation not found: {conversation_id}")
             raise HTTPException(status_code=404, detail="Conversation not found")
+        
         conversation["_id"] = str(conversation["_id"])
+        conversation["messages"].sort(key=lambda x: x["timestamp"])
+        
         return conversation
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error retrieving conversation {conversation_id}: {e}")
+        logger.error(f"Error retrieving conversation {conversation_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve conversation")
 
+@app.get("/conversations/{conversation_id}/share-url")
+@monitor_performance()
+async def get_share_url(conversation_id: str):
+    try:
+        conversation = await Database.db.conversations.find_one({"conversation_id": conversation_id})
+        if not conversation:
+            logger.warning(f"Conversation not found: {conversation_id}")
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        base_url = "https://flyhighr.github.io/archive/"
+        share_url = f"{base_url}?id={conversation_id}"
+        
+        await Database.db.conversations.update_one(
+            {"conversation_id": conversation_id},
+            {"$set": {"share_url": share_url}}
+        )
+        
+        logger.info(f"Generated share URL for conversation: {conversation_id}")
+        return {"share_url": share_url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating share URL for conversation {conversation_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to generate share URL")
+
 @app.get("/conversations")
-@measure_performance
+@monitor_performance()
 async def list_conversations(
     guild_id: Optional[str] = None,
     channel_id: Optional[str] = None,
@@ -267,45 +284,50 @@ async def list_conversations(
     skip: int = 0
 ):
     try:
-        db = await Database.get_db()
         query = {}
         if guild_id:
             query["guild_id"] = guild_id
         if channel_id:
             query["channel_id"] = channel_id
 
-        conversations = await db.conversations.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
+        total_count = await Database.db.conversations.count_documents(query)
+        conversations = await Database.db.conversations.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
         
         for conv in conversations:
             conv["_id"] = str(conv["_id"])
         
-        return conversations
+        return {
+            "conversations": conversations,
+            "total": total_count,
+            "page": skip // limit + 1,
+            "pages": (total_count + limit - 1) // limit
+        }
     except Exception as e:
-        logger.error(f"Error listing conversations: {e}")
+        logger.error(f"Error listing conversations: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to list conversations")
 
 @app.get("/health")
+@monitor_performance()
 async def health_check():
     try:
-        db = await Database.get_db()
-        await db.admin.command('ping')
+        await Database.db.admin.command('ping')
         return {
             "status": "healthy",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.utcnow(),
             "version": "1.1.0"
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        logger.error(f"Health check failed: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Service unhealthy")
 
-# Application Entry Point
 if __name__ == "__main__":
     import uvicorn
-    
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=Config.PORT,
+        port=8000,
+        reload=False,
         workers=4,
-        log_level="info"
+        log_level="info",
+        timeout_keep_alive=65
     )
