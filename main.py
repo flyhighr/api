@@ -13,18 +13,17 @@ from logging.handlers import RotatingFileHandler
 import aiohttp
 import time
 from functools import wraps
+import os
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        RotatingFileHandler('api.log', maxBytes=10000000, backupCount=5),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
-
 # Enhanced Models with modern Pydantic configuration
 class BaseModelWithConfig(BaseModel):
     model_config = ConfigDict(
@@ -112,7 +111,7 @@ class Database:
             cls.client.close()
             logger.info("MongoDB connection closed")
 
-# Self-ping service
+
 class SelfPingService:
     def __init__(self, url: str = "https://api-v9ww.onrender.com/health", interval: int = 840):
         self.url = url
@@ -136,12 +135,20 @@ class SelfPingService:
                             logger.warning(f"Self-ping failed with status {response.status}")
             except Exception as e:
                 logger.error(f"Self-ping error: {e}")
-            await asyncio.sleep(60)  # Check every minute
+            await asyncio.sleep(60)
 
     async def stop(self):
         self.is_running = False
         if self.session:
             await self.session.close()
+
+# FastAPI app initialization
+app = FastAPI(
+    title="Discord Archive API",
+    description="API for managing Discord conversation archives",
+    version="1.1.0"
+)
+
 
 # Performance monitoring decorator
 def monitor_performance():
@@ -188,13 +195,7 @@ async def lifespan(app: FastAPI):
     await ping_service.stop()
     await Database.close_db()
 
-# FastAPI app initialization
-app = FastAPI(
-    title="Discord Archive API",
-    description="API for managing Discord conversation archives",
-    version="1.1.0",
-    lifespan=lifespan
-)
+
 
 # CORS Setup
 app.add_middleware(
@@ -204,6 +205,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    await Database.connect_db()
+    # Start the self-ping service
+    ping_service = SelfPingService()
+    asyncio.create_task(ping_service.start())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await Database.close_db()
 
 # Enhanced error handling middleware with detailed logging
 @app.middleware("http")
@@ -320,14 +333,13 @@ async def health_check():
         logger.error(f"Health check failed: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Service unhealthy")
 
+PORT = int(os.getenv("PORT", 10000))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
-        port=8000,
-        reload=False,
-        workers=4,
-        log_level="info",
-        timeout_keep_alive=65
+        port=PORT,
+        workers=1  # Reduced worker count for stability
     )
