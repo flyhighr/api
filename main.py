@@ -163,7 +163,31 @@ class SelfPingService:
         if self.session:
             await self.session.close()
 
-# FastAPI app initialization with lifespan
+async def shutdown():
+    logger.info("Initiating graceful shutdown...")
+    await Database.close_db()
+    sys.exit(0)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ping_service = SelfPingService()
+    await Database.connect_db()
+    await ping_service.start()
+    
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}")
+        asyncio.create_task(shutdown())
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        yield
+    finally:
+        await ping_service.stop()
+        await Database.close_db()
+
+# FastAPI app initialization
 app = FastAPI(
     title="Discord Archive API",
     description="API for managing Discord conversation archives",
@@ -187,36 +211,6 @@ def monitor_performance():
     return decorator
 
 # Lifecycle management
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Initialize services
-    ping_service = SelfPingService()
-    
-    # Startup
-    await Database.connect_db()
-    await ping_service.start()
-    
-    # Handle shutdown signals
-    def signal_handler(sig, frame):
-        logger.info(f"Received signal {sig}")
-        asyncio.create_task(shutdown())
-
-    async def shutdown():
-        logger.info("Initiating graceful shutdown...")
-        await ping_service.stop()
-        await Database.close_db()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        yield
-    finally:
-        # Cleanup
-        await ping_service.stop()
-        await Database.close_db()
-
 # CORS Setup
 app.add_middleware(
     CORSMiddleware,
