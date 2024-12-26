@@ -76,7 +76,7 @@ class Conversation(BaseModelWithConfig):
     messages: List[Message]
     share_url: Optional[str] = None
     created_at: datetime
-    guild_id: str
+    guild_id: Optional[str] = None  # Made optional for DM support
     channel_id: str
 
 # Database connection management with retry mechanism
@@ -99,7 +99,6 @@ class Database:
                     connectTimeoutMS=10000
                 )
                 cls.db = cls.client.discord_archives
-                # Fixed: Use client.admin.command instead of db.admin.command
                 await cls.client.admin.command('ping')
                 logger.info("Successfully connected to MongoDB")
                 return
@@ -210,7 +209,6 @@ def monitor_performance():
         return wrapper
     return decorator
 
-# Lifecycle management
 # CORS Setup
 app.add_middleware(
     CORSMiddleware,
@@ -325,7 +323,6 @@ async def list_conversations(
 @monitor_performance()
 async def health_check():
     try:
-        # Fixed: Use client.admin.command instead of db.admin.command
         await Database.client.admin.command('ping')
         return {
             "status": "healthy",
