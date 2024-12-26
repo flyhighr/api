@@ -15,14 +15,13 @@ import time
 from functools import wraps
 import os
 
-# Configure logging with rotating file handler
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         RotatingFileHandler(
             'app.log',
-            maxBytes=1024*1024,  # 1MB
+            maxBytes=1024*1024,  
             backupCount=5
         ),
         logging.StreamHandler(sys.stdout)
@@ -30,7 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Enhanced Models with modern Pydantic configuration
+
 class BaseModelWithConfig(BaseModel):
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -76,10 +75,9 @@ class Conversation(BaseModelWithConfig):
     messages: List[Message]
     share_url: Optional[str] = None
     created_at: datetime
-    guild_id: Optional[str] = None  # Made optional for DM support
+    guild_id: Optional[str] = None 
     channel_id: str
 
-# Database connection management with retry mechanism
 class Database:
     client: Optional[AsyncIOMotorClient] = None
     db = None
@@ -186,7 +184,6 @@ async def lifespan(app: FastAPI):
         await ping_service.stop()
         await Database.close_db()
 
-# FastAPI app initialization
 app = FastAPI(
     title="Discord Archive API",
     description="API for managing Discord conversation archives",
@@ -194,7 +191,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Performance monitoring decorator
 def monitor_performance():
     def decorator(func):
         @wraps(func)
@@ -209,7 +205,6 @@ def monitor_performance():
         return wrapper
     return decorator
 
-# CORS Setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -218,7 +213,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enhanced error handling middleware
 @app.middleware("http")
 async def error_handling_middleware(request, call_next):
     try:
@@ -231,7 +225,6 @@ async def error_handling_middleware(request, call_next):
         logger.error(f"Unhandled error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# Enhanced routes with performance monitoring
 @app.post("/conversations/")
 @monitor_performance()
 async def create_conversation(conversation: Conversation):
@@ -333,7 +326,6 @@ async def health_check():
         logger.error(f"Health check failed: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Service unhealthy")
 
-# Environment variables
 PORT = int(os.getenv("PORT", 10000))
 
 if __name__ == "__main__":
