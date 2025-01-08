@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 import logging
 import asyncio
@@ -29,7 +29,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 class BaseModelWithConfig(BaseModel):
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -37,15 +36,16 @@ class BaseModelWithConfig(BaseModel):
         from_attributes=True
     )
 
-class ReactionUser(BaseModelWithConfig):
+class Author(BaseModelWithConfig):
     id: str
-    name: str
-    avatar_url: str
+    username: str
+    global_name: Optional[str] = None
+    avatar_url: Optional[str] = None
 
-class Reaction(BaseModelWithConfig):
-    emoji: str
-    count: int
-    users: List[ReactionUser]
+class ReplyReference(BaseModelWithConfig):
+    message_id: str
+    author: Author
+    content: str
 
 class Attachment(BaseModelWithConfig):
     url: str
@@ -53,30 +53,32 @@ class Attachment(BaseModelWithConfig):
     content_type: str
     size: int
 
-class ReplyReference(BaseModelWithConfig):
-    message_id: str
-    author: str
-    content: str
+class ReactionUser(BaseModelWithConfig):
+    id: str
+    username: str
+    global_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class Reaction(BaseModelWithConfig):
+    emoji: str
+    count: int
+    users: List[ReactionUser]
 
 class Message(BaseModelWithConfig):
     content: str
-    author: str
-    author_nickname: Optional[str] = None
-    avatar_url: str
-    timestamp: datetime
-    edited_timestamp: Optional[datetime] = None
+    author: Author
+    timestamp: str
     message_id: str
+    attachments: List[Attachment] = Field(default_factory=list)
     reply_to: Optional[ReplyReference] = None
     reactions: List[Reaction] = Field(default_factory=list)
-    attachments: List[Attachment] = Field(default_factory=list)
 
 class Conversation(BaseModelWithConfig):
     conversation_id: str
     messages: List[Message]
-    share_url: Optional[str] = None
-    created_at: datetime
-    guild_id: Optional[str] = None 
     channel_id: str
+    created_at: str
+    share_url: Optional[str] = None
 
 class Database:
     client: Optional[AsyncIOMotorClient] = None
@@ -187,7 +189,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Discord Archive API",
     description="API for managing Discord conversation archives",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan
 )
 
@@ -284,15 +286,12 @@ async def get_share_url(conversation_id: str):
 @app.get("/conversations")
 @monitor_performance()
 async def list_conversations(
-    guild_id: Optional[str] = None,
     channel_id: Optional[str] = None,
     limit: int = 10,
     skip: int = 0
 ):
     try:
         query = {}
-        if guild_id:
-            query["guild_id"] = guild_id
         if channel_id:
             query["channel_id"] = channel_id
 
@@ -320,7 +319,7 @@ async def health_check():
         return {
             "status": "healthy",
             "timestamp": datetime.utcnow(),
-            "version": "1.1.0"
+            "version": "1.2.0"
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}", exc_info=True)
