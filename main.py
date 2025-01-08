@@ -267,7 +267,7 @@ async def get_share_url(conversation_id: str):
             logger.warning(f"Conversation not found: {conversation_id}")
             raise HTTPException(status_code=404, detail="Conversation not found")
         
-        base_url = os.getenv("BASE_URL", "https://flyhighr.github.io/archive/")
+        base_url = os.getenv("BASE_URL", "https://archive.3utilities.com/")
         share_url = f"{base_url}?id={conversation_id}"
         
         await Database.db.conversations.update_one(
